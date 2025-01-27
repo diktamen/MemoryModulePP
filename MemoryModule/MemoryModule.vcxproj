@@ -396,7 +396,7 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='ReleaseDll|Win32'">
     <LinkIncremental>false</LinkIncremental>
     <IncludePath>$(VC_IncludePath);$(WindowsSDK_IncludePath);$(SolutionDir);</IncludePath>
-    <OutDir>..\..\nativelibs\lib-bin</OutDir>
+    <OutDir>..\..\nativelibs\lib-bin\</OutDir>
     <TargetName>MemoryModule32</TargetName>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='ReleaseDll|ARM'">
@@ -414,13 +414,13 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='ReleaseDll|x64'">
     <LinkIncremental>false</LinkIncremental>
     <IncludePath>$(VC_IncludePath);$(WindowsSDK_IncludePath);$(SolutionDir);</IncludePath>
-    <OutDir>..\..\nativelibs\lib-bin</OutDir>
+    <OutDir>..\..\nativelibs\lib-bin\</OutDir>
     <TargetName>MemoryModule64</TargetName>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='ReleaseDll|ARM64'">
     <LinkIncremental>false</LinkIncremental>
     <IncludePath>$(VC_IncludePath);$(WindowsSDK_IncludePath);$(SolutionDir);</IncludePath>
-    <OutDir>..\..\nativelibs\lib-bin</OutDir>
+    <OutDir>..\..\nativelibs\lib-bin\</OutDir>
     <TargetName>MemoryModulearm</TargetName>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
