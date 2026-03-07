@@ -25,24 +25,26 @@
 #define LOAD_FLAGS_PASS_IMAGE_CHECK					0x40000000
 
 //If this flag is specified, exception handling will not be supported.
-#define LOAD_FLAGS_NOT_ADD_INVERTED_FUNCTION		0x00000001
+// NOTE: flags start at 0x00010000 to avoid collision with Windows LoadLibraryEx flags
+// (e.g. LOAD_WITH_ALTERED_SEARCH_PATH = 0x8) which callers may pass through.
+#define LOAD_FLAGS_NOT_ADD_INVERTED_FUNCTION		0x00010000
 
 //If this flag is specified, LdrLoadDllMemory and LdrUnloadDllMemory will not use reference counting.
 //If you try to load the same module, it will fail. When you unload the module,
 //	it will be unloaded without checking the reference count.
-#define LOAD_FLAGS_NOT_USE_REFERENCE_COUNT			0x00000002
+#define LOAD_FLAGS_NOT_USE_REFERENCE_COUNT			0x00020000
 
 //If this flag is specified, DllName and DllFullName cannot be nullptr,
 //	they can be arbitrary strings without having to be correct file names and paths.
 //Otherwise, DllName and DllFullName will use random names if they are nullptr.
 //For compatibility with GetModuleHandle, DllName and DllFullName should be guaranteed to always end in ".dll"
-#define LOAD_FLAGS_USE_DLL_NAME						0x00000004
+#define LOAD_FLAGS_USE_DLL_NAME						0x00040000
 
 //Dont call LdrpHandleTlsData routine if this flag is specified.
-#define LOAD_FLAGS_NOT_HANDLE_TLS					0x00000008
+#define LOAD_FLAGS_NOT_HANDLE_TLS					0x00080000
 
 //Hook for dotnet dlls
-#define LOAD_FLAGS_HOOK_DOT_NET						0x00000010
+#define LOAD_FLAGS_HOOK_DOT_NET						0x00100000
 
 extern "C" {
 
