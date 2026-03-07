@@ -199,6 +199,11 @@ VOID NTAPI MmpTlsCleanup() {
 }
 
 NTSTATUS NTAPI MmpReleaseTlsEntry(_In_ PLDR_DATA_TABLE_ENTRY lpModuleEntry) {
+	ULONG DirectorySize;
+	if (!RtlImageDirectoryEntryToData(lpModuleEntry->DllBase, TRUE, IMAGE_DIRECTORY_ENTRY_TLS, &DirectorySize) || !DirectorySize) {
+		return STATUS_SUCCESS;
+	}
+
 	typedef NTSTATUS(__stdcall* STDCALL)(PLDR_DATA_TABLE_ENTRY, PVOID*);
 	typedef NTSTATUS(__thiscall* THISCALL)(PLDR_DATA_TABLE_ENTRY, PVOID*);
 
@@ -219,6 +224,11 @@ NTSTATUS NTAPI MmpReleaseTlsEntry(_In_ PLDR_DATA_TABLE_ENTRY lpModuleEntry) {
 }
 
 NTSTATUS NTAPI MmpHandleTlsData(_In_ PLDR_DATA_TABLE_ENTRY lpModuleEntry) {
+	ULONG DirectorySize;
+	if (!RtlImageDirectoryEntryToData(lpModuleEntry->DllBase, TRUE, IMAGE_DIRECTORY_ENTRY_TLS, &DirectorySize) || !DirectorySize) {
+		return STATUS_SUCCESS;
+	}
+
 	typedef NTSTATUS(__stdcall* STDCALL)(PLDR_DATA_TABLE_ENTRY);
 	typedef NTSTATUS(__thiscall* THISCALL)(PLDR_DATA_TABLE_ENTRY);
 
