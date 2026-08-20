@@ -440,7 +440,11 @@ int MmpSyncThreadTlsData() {
                         if (NT_SUCCESS(status)) {
 
                             PTEB teb = tbi.TebBaseAddress;
-                            if (teb->ThreadLocalStoragePointer) {
+                            // A thread that is exiting can pass the NT_SUCCESS
+                            // check above yet report a NULL TebBaseAddress once
+                            // its TEB has been torn down; guard before reading
+                            // teb->ThreadLocalStoragePointer.
+                            if (teb && teb->ThreadLocalStoragePointer) {
 
                                 //
                                 // Allocate TLS record

@@ -1,5 +1,40 @@
 #include "stdafx.h"
 
+//
+// LdrpInvertedFunctionTable is a process-global structure owned by ntdll.
+// ntdll mutates it from its own loader (LdrpInsertInvertedFunctionTableEntry)
+// while holding the loader lock, and the RtlProtectMrdata() flip below toggles
+// the protection of that shared page process-wide. Mutating it here without the
+// loader lock races ntdll's concurrent DLL loads (e.g. an EDR agent or codec
+// loading on another thread): the entry count/array or the page protection are
+// observed mid-update, and the RtlMoveMemory() shift then runs with a corrupt
+// length and writes past the table. Take the loader lock for the whole
+// read-modify-write so we are mutually exclusive with ntdll. The lock is
+// recursive per-thread, so re-entering from within a load is safe.
+//
+namespace {
+	struct MmpLoaderLockGuard {
+		PVOID Cookie = nullptr;
+		bool Held = false;
+
+		MmpLoaderLockGuard() {
+			ULONG disposition = LDR_LOCK_LOADER_LOCK_DISPOSITION_INVALID;
+			if (NT_SUCCESS(LdrLockLoaderLock(0, &disposition, &Cookie)) &&
+				disposition == LDR_LOCK_LOADER_LOCK_DISPOSITION_LOCK_ACQUIRED) {
+				Held = true;
+			}
+		}
+		~MmpLoaderLockGuard() {
+			if (Held) {
+				LdrUnlockLoaderLock(0, Cookie);
+			}
+		}
+
+		MmpLoaderLockGuard(const MmpLoaderLockGuard&) = delete;
+		MmpLoaderLockGuard& operator=(const MmpLoaderLockGuard&) = delete;
+	};
+}
+
 static VOID RtlpInsertInvertedFunctionTable(
 	_In_ PRTL_INVERTED_FUNCTION_TABLE InvertedTable,
 	_In_ PVOID ImageBase,
@@ -165,10 +200,17 @@ static NTSTATUS RtlProtectMrdata(_In_ ULONG Protect) {
 NTSTATUS NTAPI RtlInsertInvertedFunctionTable(
 	_In_ PVOID BaseAddress,
 	_In_ ULONG ImageSize) {
-	auto table = PRTL_INVERTED_FUNCTION_TABLE(MmpGlobalDataPtr->MmpInvertedFunctionTable->LdrpInvertedFunctionTable);
-	if (!table)return STATUS_NOT_SUPPORTED;
+	// The version check is a pure PEB read of a value fixed at process start, so
+	// keep it out of the lock. The table pointer lives in the global data that
+	// MmInitialize()/MmCleanup() publish and tear down under the loader lock, so
+	// read it under that same lock, together with the mutation it guards.
 	bool need_virtual_protect = RtlIsWindowsVersionOrGreater(6, 3, 0);
 	NTSTATUS status;
+
+	MmpLoaderLockGuard loaderLock;
+
+	auto table = PRTL_INVERTED_FUNCTION_TABLE(MmpGlobalDataPtr->MmpInvertedFunctionTable->LdrpInvertedFunctionTable);
+	if (!table)return STATUS_NOT_SUPPORTED;
 
 	if (need_virtual_protect) {
 		status = RtlProtectMrdata(PAGE_READWRITE);
@@ -184,9 +226,13 @@ NTSTATUS NTAPI RtlInsertInvertedFunctionTable(
 }
 
 NTSTATUS NTAPI RtlRemoveInvertedFunctionTable(_In_ PVOID ImageBase) {
-	auto table = PRTL_INVERTED_FUNCTION_TABLE(MmpGlobalDataPtr->MmpInvertedFunctionTable->LdrpInvertedFunctionTable);
 	bool need_virtual_protect = RtlIsWindowsVersionOrGreater(6, 3, 0);
 	NTSTATUS status;
+
+	MmpLoaderLockGuard loaderLock;
+
+	auto table = PRTL_INVERTED_FUNCTION_TABLE(MmpGlobalDataPtr->MmpInvertedFunctionTable->LdrpInvertedFunctionTable);
+	if (!table)return STATUS_NOT_SUPPORTED;
 
 	if (need_virtual_protect) {
 		status = RtlProtectMrdata(PAGE_READWRITE);
