@@ -528,6 +528,64 @@ NTSTATUS NTAPI MmInitialize() {
     return status;
 }
 
+//
+// Initialization used to run from DllMain, and none of it needed to.
+//
+// What it does is not DllMain work: it creates a named section, calls out to
+// kernel32 for GetSystemInfo and five GetProcAddress lookups -- which re-enter
+// ntdll's loader -- walks PEB->Ldr, and pattern-scans ntdll. Best practice says
+// keep DllMain to a minimum, and this was the opposite of minimum.
+//
+// It also cost us the one check that would settle whether the located lock is
+// the right one. The causality check needs a probe thread and a wait on it, and
+// from DllMain that deadlocks: the new thread cannot run its DLL_THREAD_ATTACH
+// until the loader lock we are holding comes free. That is the whole of why the
+// library had to accept the address on structural checks while the bench could
+// prove it.
+//
+// So initialization is deferred to the first call that actually needs it, which
+// runs on an ordinary thread with nothing held. MmpVerifyModuleDatatableLock
+// becomes legal there, and DllMain does nothing at all.
+//
+// Reference counting stays with MmInitialize, which is public and may be called
+// explicitly; this guard runs it at most once and stands aside entirely if a
+// caller got there first.
+//
+static volatile LONG MmpInitializeState = 0;    // 0 untouched, 1 running, 2 done
+static volatile LONG MmpInitializeOwner = 0;
+static NTSTATUS      MmpInitializeStatus = STATUS_UNSUCCESSFUL;
+
+NTSTATUS NTAPI MmpEnsureInitialized() {
+	if (MmpInitializeState == 2) return MmpInitializeStatus;
+
+	LONG self = HandleToLong(NtCurrentTeb()->ClientId.UniqueThread);
+
+	//
+	// Re-entered by the thread already running initialization -- a memory
+	// module's DllMain calling back in through the loader, say. Spinning here
+	// would wait on ourselves.
+	//
+	if (MmpInitializeState == 1 && MmpInitializeOwner == self) return MmpInitializeStatus;
+
+	if (InterlockedCompareExchange(&MmpInitializeState, 1, 0) == 0) {
+		InterlockedExchange(&MmpInitializeOwner, self);
+
+		MmpInitializeStatus = MmpGlobalDataPtr ? STATUS_SUCCESS : MmInitialize();
+		if (NT_SUCCESS(MmpInitializeStatus)) MmpVerifyModuleDatatableLock();
+
+		InterlockedExchange(&MmpInitializeState, 2);
+		return MmpInitializeStatus;
+	}
+
+	//
+	// Another thread got there first. This is a one-time window measured in
+	// milliseconds, so yielding beats standing up an event we would never use
+	// again.
+	//
+	while (MmpInitializeState != 2) NtYieldExecution();
+	return MmpInitializeStatus;
+}
+
 NTSTATUS CleanupLockHeld() {
 
 	PLIST_ENTRY ListHead = &NtCurrentPeb()->Ldr->InLoadOrderModuleList, ListEntry = ListHead->Flink;
@@ -639,17 +697,22 @@ extern "C" __declspec(dllexport) BOOL WINAPI ReflectiveMapDll(HMODULE hModule) {
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ul_reason_for_call, LPVOID lpReserved) {
 	if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
 #ifdef _HAS_AUTO_INITIALIZE
-		if (NT_SUCCESS(MmInitialize())) {
-			if (lpReserved == (PVOID)-1) {
-				if (!ReflectiveMapDll(hModule)) {
-					RtlRaiseStatus(STATUS_NOT_SUPPORTED);
-				}
+		//
+		// A reflective load is the one case that has to initialize here: the
+		// injector has already mapped us and calls this entry point directly,
+		// so there is no later API call to defer to. It pays the DllMain cost
+		// knowingly, and MmpVerifyModuleDatatableLock detects the held loader
+		// lock and skips itself.
+		//
+		// Every other consumer initializes on first use. See
+		// MmpEnsureInitialized for why none of that belongs here.
+		//
+		if (lpReserved == (PVOID)-1) {
+			if (!NT_SUCCESS(MmpEnsureInitialized())) return FALSE;
+			if (!ReflectiveMapDll(hModule)) {
+				RtlRaiseStatus(STATUS_NOT_SUPPORTED);
 			}
-
-			return TRUE;
 		}
-
-		return FALSE;
 #endif
 	}
 
@@ -657,6 +720,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ul_reason_for_call, LPVOID lpReser
 }
 #else
 #ifdef _HAS_AUTO_INITIALIZE
-const NTSTATUS Initializer = MmInitialize();
+//
+// Static-library build. This runs from CRT static initialization, which for an
+// executable is an ordinary thread with nothing held -- so the causality check
+// can run here, and going through the guard rather than MmInitialize directly is
+// what gives it the chance. Linked into somebody else's DLL it lands in their
+// DllMain instead, where the check detects the held loader lock and skips.
+//
+const NTSTATUS Initializer = MmpEnsureInitialized();
 #endif
 #endif

@@ -68,11 +68,17 @@
 //            inlining the acquire in donor after donor, since the capability
 //            does not fail loudly -- it just stops locating the lock.
 //
+//   Verified 1 once the causality check below has confirmed the address
+//            behaviourally. 0 means the address rests on donor agreement and
+//            the structural checks alone -- which is what shipped originally,
+//            and is still the case whenever the check has to be skipped.
+//
 extern "C" __declspec(dllexport) volatile LONG MmpModuleDatatableLockLocated;
 extern "C" __declspec(dllexport) volatile LONG MmpModuleDatatableLockAcquires;
 extern "C" __declspec(dllexport) volatile LONG MmpModuleDatatableLockSkipped;
 extern "C" __declspec(dllexport) volatile LONG MmpModuleDatatableLockRva;
 extern "C" __declspec(dllexport) volatile LONG MmpModuleDatatableLockAgreement;
+extern "C" __declspec(dllexport) volatile LONG MmpModuleDatatableLockVerified;
 
 //
 // Locate the lock. Call once from MmInitialize, with the loader lock already
@@ -81,6 +87,19 @@ extern "C" __declspec(dllexport) volatile LONG MmpModuleDatatableLockAgreement;
 // before this file existed.
 //
 NTSTATUS NTAPI MmpInitializeModuleDatatableLock();
+
+//
+// Confirm the located address behaviourally: hold it exclusively and require
+// that an ordinary LoadLibrary on another thread cannot finish, then require
+// that it finishes the moment we let go. A wrong address cannot pass both.
+//
+// Must be called with the loader lock NOT held, which is why it cannot live
+// beside MmpInitializeModuleDatatableLock: the probe thread's DLL_THREAD_ATTACH
+// needs the loader lock, so running this from DllMain would deadlock. It runs
+// from MmpEnsureInitialized instead, on the first real load. Safe to call more
+// than once and safe to call when the lock was never located; both are no-ops.
+//
+VOID NTAPI MmpVerifyModuleDatatableLock();
 
 //
 // RAII exclusive hold. Constructing one when the lock was never located is a

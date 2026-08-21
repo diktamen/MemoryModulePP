@@ -455,26 +455,54 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    //
-    // Take the address of ntdll!LdrpModuleDatatableLock from the DLL under test,
-    // which located it during its own initialization. Used only to make the
-    // integrity check below read the loader lists under the correct lock.
-    //
-    {
-        auto rva = (volatile LONG*)GetProcAddress(mm, "MmpModuleDatatableLockRva");
-        auto located = (volatile LONG*)GetProcAddress(mm, "MmpModuleDatatableLockLocated");
-        g_acquireShared = (PFN_SRW)GetProcAddress(ntdll, "RtlAcquireSRWLockShared");
-        g_releaseShared = (PFN_SRW)GetProcAddress(ntdll, "RtlReleaseSRWLockShared");
-        if (rva && located && *located && *rva && g_acquireShared && g_releaseShared) {
-            g_datatableLock = (PVOID)((BYTE*)ntdll + *rva);
-        }
-    }
-
     size_t imageSize = 0;
     PVOID image = ReadFileIntoMemory(payloadPath, &imageSize);
     if (!image) {
         fprintf(stderr, "failed to read payload %s\n", payloadPath);
         return 1;
+    }
+
+    //
+    // The library no longer initializes from DllMain, so nothing has been
+    // located yet -- read the flag now and assert that, because a build that
+    // regressed to initializing in DllMain would still pass every other check
+    // here while silently losing the causality verification.
+    //
+    auto locatedFlag = (volatile LONG*)GetProcAddress(mm, "MmpModuleDatatableLockLocated");
+    bool eagerInDllMain = locatedFlag && *locatedFlag;
+
+    //
+    // One throwaway load to trigger first-use initialization. This is the path a
+    // real consumer takes, and it is what runs the causality check -- on an
+    // ordinary thread, which is the whole point of moving init out of DllMain.
+    //
+    {
+        // Same flags the loader threads use, minus the name options: a bare
+        // load fails on the TLS defect this bench already tolerates.
+        DWORD warmFlags = LOAD_FLAGS_NOT_FAIL_IF_HANDLE_TLS;
+        if (g_skipInvertedTable) warmFlags |= LOAD_FLAGS_NOT_ADD_INVERTED_FUNCTION;
+
+        HMODULE warmup = g_loadMemory(image, 0, nullptr, nullptr, warmFlags);
+        if (!warmup) {
+            fprintf(stderr, "warm-up load failed (error %lu); lock located=%ld\n",
+                GetLastError(), locatedFlag ? (long)*locatedFlag : -1);
+            return 1;
+        }
+        g_freeMemory(warmup);
+    }
+
+    //
+    // Take the address of ntdll!LdrpModuleDatatableLock from the DLL under test,
+    // now that initialization has run. Used only to make the integrity check
+    // below read the loader lists under the correct lock.
+    //
+    {
+        auto rva = (volatile LONG*)GetProcAddress(mm, "MmpModuleDatatableLockRva");
+        g_acquireShared = (PFN_SRW)GetProcAddress(ntdll, "RtlAcquireSRWLockShared");
+        g_releaseShared = (PFN_SRW)GetProcAddress(ntdll, "RtlReleaseSRWLockShared");
+        if (rva && locatedFlag && *locatedFlag && *rva && g_acquireShared && g_releaseShared) {
+            g_datatableLock = (PVOID)((BYTE*)ntdll + *rva);
+        }
     }
 
     printf("MemoryModulePP loader stress\n");
@@ -588,6 +616,17 @@ int main(int argc, char** argv) {
             //
             if (*located && agree) printf("  (%ld donors agreed, need 2)", (long)*agree);
             printf("\n");
+            //
+            // Deferring init out of DllMain is what makes the causality check
+            // possible at all, so report both facts together: they stand or
+            // fall as one change.
+            //
+            auto verified = (volatile LONG*)GetProcAddress(mm, "MmpModuleDatatableLockVerified");
+            printf("  datatable init    : %s, causality %s\n",
+                eagerInDllMain ? "EAGER IN DllMain (regressed)" : "deferred to first use",
+                !verified ? "(not exported)"
+                : *verified ? "VERIFIED"
+                : "not verified (structural checks only)");
             if (acquires) printf("  datatable acquires: %ld\n", *acquires);
             if (skipped && *skipped) printf("  datatable skipped : %ld\n", *skipped);
         }

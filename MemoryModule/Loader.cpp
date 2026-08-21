@@ -94,6 +94,15 @@ NTSTATUS NTAPI LdrLoadDllMemoryExW(
 
 	if (BufferSize)return STATUS_INVALID_PARAMETER_5;
 
+	//
+	// Initialization happens here rather than in DllMain, on an ordinary thread
+	// with nothing held. Every LoadLibraryMemory* entry point funnels through
+	// this function, so this is the only load-side hook needed. After the first
+	// call it is a single read.
+	//
+	status = MmpEnsureInitialized();
+	if (!NT_SUCCESS(status))return status;
+
 	status = MmpValidateLoadDllMemoryParameters(BaseAddress, LdrEntry, dwFlags, BufferAddress, BufferSize);
 	if (!NT_SUCCESS(status))return status;
 
@@ -445,7 +454,9 @@ VOID NTAPI LdrUnloadDllMemoryAndExitThread(_In_ HMEMORYMODULE BaseAddress, _In_ 
 }
 
 NTSTATUS NTAPI LdrQuerySystemMemoryModuleFeatures(_Out_ PDWORD pFeatures) {
-	NTSTATUS status = STATUS_SUCCESS;
+	NTSTATUS status = MmpEnsureInitialized();
+	if (!NT_SUCCESS(status))return status;
+
 	__try {
 		*pFeatures = MmpGlobalDataPtr->MmpFeatures;
 	}

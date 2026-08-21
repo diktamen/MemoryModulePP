@@ -531,6 +531,115 @@ NTSTATUS NTAPI MmpInitializeModuleDatatableLock() {
 	return STATUS_SUCCESS;
 }
 
+extern "C" volatile LONG MmpModuleDatatableLockVerified = 0;
+
+//
+// Context for the probe thread. File-scope rather than a local: on the
+// pathological path where the probe cannot finish we give up waiting for it, and
+// a stack-allocated context would be released while that thread still held a
+// pointer to it. Only ever used by the single verification below.
+//
+static struct {
+	HANDLE Ready;
+	HANDLE Go;
+	HANDLE Done;
+} MmpLockProbe = { nullptr, nullptr, nullptr };
+
+static DWORD WINAPI MmpLockProbeThread(LPVOID Parameter) {
+	UNREFERENCED_PARAMETER(Parameter);
+	SetEvent(MmpLockProbe.Ready);
+	WaitForSingleObject(MmpLockProbe.Go, INFINITE);
+
+	//
+	// An ordinary load. It has to pass through the loader database, so it has to
+	// take the lock we are holding.
+	//
+	HMODULE module = LoadLibraryW(L"version.dll");
+	if (module) FreeLibrary(module);
+
+	SetEvent(MmpLockProbe.Done);
+	return 0;
+}
+
+//
+// True when this thread already owns ntdll's loader lock, which is what being
+// called from inside somebody's DllMain looks like.
+//
+static BOOLEAN MmpLoaderLockHeldByCurrentThread() {
+	PRTL_CRITICAL_SECTION lock = NtCurrentPeb()->LoaderLock;
+	return lock && lock->OwningThread == NtCurrentTeb()->ClientId.UniqueThread;
+}
+
+VOID NTAPI MmpVerifyModuleDatatableLock() {
+	if (!MmpModuleDatatableLock || MmpModuleDatatableLockVerified) return;
+
+	//
+	// Entered from a DllMain we do not control. The probe thread cannot run its
+	// DLL_THREAD_ATTACH until that DllMain returns, so both waits below would
+	// expire and a perfectly good address would read as a failure. Skip, and
+	// leave the lock resting on donor agreement plus the structural checks.
+	//
+	if (MmpLoaderLockHeldByCurrentThread()) return;
+
+	MmpLockProbe.Ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+	MmpLockProbe.Go = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+	MmpLockProbe.Done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+	if (!MmpLockProbe.Ready || !MmpLockProbe.Go || !MmpLockProbe.Done) return;
+
+	//
+	// Started before the lock is taken: thread start-up runs DLL_THREAD_ATTACH,
+	// which enters the loader, and that has to happen while nothing is held.
+	//
+	HANDLE thread = CreateThread(nullptr, 0, MmpLockProbeThread, nullptr, 0, nullptr);
+	if (!thread) return;
+
+	//
+	// Wait for the probe to reach its wait rather than sleeping a guessed
+	// interval. If it cannot even get that far the machine is in no state to be
+	// measured, so leave the lock on the structural checks and give up.
+	//
+	if (WaitForSingleObject(MmpLockProbe.Ready, 5000) != WAIT_OBJECT_0) return;
+
+	MmpAcquireSRWLockExclusive(MmpModuleDatatableLock);
+	SetEvent(MmpLockProbe.Go);
+	DWORD blocked = WaitForSingleObject(MmpLockProbe.Done, 400);
+	MmpReleaseSRWLockExclusive(MmpModuleDatatableLock);
+	DWORD freed = WaitForSingleObject(MmpLockProbe.Done, 5000);
+
+	if (blocked == WAIT_OBJECT_0) {
+		//
+		// Positive disproof: the loader walked straight through a lock we were
+		// holding exclusively, so this is not the lock it needs. Stand the
+		// capability down rather than keep taking an unrelated word as an SRW
+		// lock, which would corrupt whatever actually owns it.
+		//
+		MmpModuleDatatableLock = nullptr;
+		MmpModuleDatatableLockLocated = 0;
+	}
+	else if (freed == WAIT_OBJECT_0) {
+		MmpModuleDatatableLockVerified = 1;
+	}
+	//
+	// Anything else is inconclusive -- a loaded-down machine, or a probe that
+	// never got scheduled. Deliberately not treated as a failure: switching the
+	// lock off on an ambiguous result brings back the list corruption this
+	// exists to prevent, and the structural checks already stand behind it.
+	//
+
+	if (WaitForSingleObject(thread, 5000) == WAIT_OBJECT_0) {
+		CloseHandle(thread);
+		CloseHandle(MmpLockProbe.Ready);
+		CloseHandle(MmpLockProbe.Go);
+		CloseHandle(MmpLockProbe.Done);
+		MmpLockProbe.Ready = MmpLockProbe.Go = MmpLockProbe.Done = nullptr;
+	}
+	//
+	// Otherwise leak the three handles on purpose. The thread still holds the
+	// event handles, and closing them under it is worse than a bounded leak on a
+	// path that runs at most once per process.
+	//
+}
+
 MmpDatatableLockGuard::MmpDatatableLockGuard() : Lock(MmpModuleDatatableLock) {
 	if (!Lock) {
 		InterlockedIncrement(&MmpModuleDatatableLockSkipped);

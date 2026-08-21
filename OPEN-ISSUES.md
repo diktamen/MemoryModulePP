@@ -105,27 +105,52 @@ library currently loads and runs unsynchronized, exactly as before the fix.
 
 ---
 
-## 3. The library's validation is weaker than the probe's
+## 3. The library's validation is weaker than the probe's — FIXED
 
-**Status:** by design, mitigated, not eliminated.
+**Status:** fixed. The library now runs the same causality check the bench does,
+and reports the result.
 
 `stress/lockprobe.cpp` proves an address by causality: hold it exclusively and
 confirm an ordinary `LoadLibrary` on another thread blocks, then completes on
 release. A wrong address cannot pass that.
 
-The library cannot run that test. It initialises inside `DllMain`, where creating
-the probe thread would deadlock against the loader lock. So it accepts an address
-on donor agreement plus structural checks: pointer-aligned, inside ntdll's image,
-committed, writable. Those are a sanity filter, not a proof.
+The library could not run that test *only because initialization ran from
+`DllMain`*, where the probe thread cannot start — its `DLL_THREAD_ATTACH` needs
+the loader lock `DllMain` is holding, so the wait deadlocks. That constraint was
+self-imposed, not inherent: nothing about locating the lock required `DllMain`.
 
-`lockprobe` now prints a `library verdict` line predicting whether the library
-would accept what it verified; it has read `WOULD ACCEPT` in every configuration
-tested. But the two paths remain different tests, and only the probe is
-conclusive.
+**Initialization now happens on first use.** `MmpEnsureInitialized` runs the
+whole of `MmInitialize` once, from whichever thread first calls
+`LdrLoadDllMemoryExW` or `LdrQuerySystemMemoryModuleFeatures` — an ordinary
+thread with nothing held. `MmpVerifyModuleDatatableLock` runs there, and
+`MmpModuleDatatableLockVerified` reports whether it passed. Measured on all three
+configurations: `deferred to first use, causality VERIFIED`.
 
-**Possible improvement, not implemented:** defer the causality check to the first
-`LdrLoadDllMemoryExW` call, which runs outside `DllMain` and could safely spawn
-the probe thread once.
+This also took a substantial amount of work out of `DllMain` that never belonged
+there: a named section creation, `GetSystemInfo`, five `GetProcAddress` lookups
+that re-enter ntdll's loader, a `PEB->Ldr` walk, and four pattern scans.
+`DllMain` now does nothing on `DLL_PROCESS_ATTACH`.
+
+Two things to know about the new behaviour:
+
+- **The diagnostic exports and `MmpGlobalDataPtr` read zero until the first
+  load.** Anything reading them straight after `LoadLibrary` sees an
+  uninitialized library. Call `MmInitialize` explicitly if eager setup is wanted;
+  the guard stands aside when it finds the library already initialized.
+- **The check costs up to ~400 ms on the first load**, which is the window it
+  waits to be sure a non-blocked `LoadLibrary` would have finished. One-time, and
+  tunable if that turns out to matter.
+
+**Residual gap:** the check skips itself when the calling thread already owns the
+loader lock — a consumer calling in from their own `DllMain`, and the reflective
+path, which must initialize there. Skipping is deliberate: the probe thread could
+not start, both waits would expire, and a correct address would read as a
+failure. In that case the lock still rests on donor agreement plus the structural
+checks, exactly as before, and `MmpModuleDatatableLockVerified` reads 0 to say
+so. Note also that only a *positive* disproof — the load completing while the
+lock is held — stands the capability down; an inconclusive result leaves it in
+place, because switching it off on ambiguity brings back the corruption it
+exists to prevent.
 
 ---
 

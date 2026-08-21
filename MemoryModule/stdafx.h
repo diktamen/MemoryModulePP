@@ -42,6 +42,9 @@
 //MemoryModulePP api interface
 #include "Loader.h"
 
+//MmInitialize/MmCleanup, and the first-use initialization guard
+#include "Initialize.h"
+
 //utils
 #include "Utils.h"
 
