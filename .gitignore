@@ -343,3 +343,7 @@ healthchecksdb
 
 # Claude Code session data
 .claude/
+
+# Loader stress harness build output
+stress/bin/
+stress/bin-prepatch/
