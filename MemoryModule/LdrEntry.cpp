@@ -139,7 +139,17 @@ BOOL NTAPI RtlInitializeLdrDataTableEntry(
 		entry->OriginalBase = headers->OptionalHeader.ImageBase;
 		entry->BaseNameHashValue = LdrHashEntry(DllBaseName, false);
 		entry->LoadReason = LoadReasonDynamicLoad;
-		if (!NT_SUCCESS(RtlInsertModuleBaseAddressIndexNode(LdrEntry, BaseAddress)))return FALSE;
+		//
+		// The base-address index is ntdll's red-black tree, guarded by
+		// ntdll!LdrpModuleDatatableLock. The walk that finds the insertion point
+		// reads nodes ntdll may be rebalancing, so the lock has to cover the
+		// search as well as the insert, which is why it is taken out here rather
+		// than inside RtlInsertModuleBaseAddressIndexNode.
+		//
+		{
+			MmpDatatableLockGuard databaseLock;
+			if (!NT_SUCCESS(RtlInsertModuleBaseAddressIndexNode(LdrEntry, BaseAddress)))return FALSE;
+		}
 		if (!(entry->DdagNode = (decltype(entry->DdagNode))
 			RtlAllocateHeap(heap, HEAP_ZERO_MEMORY, IsWin8 ? sizeof(_LDR_DDAG_NODE_WIN8) : sizeof(_LDR_DDAG_NODE))))return FALSE;
 
@@ -242,14 +252,29 @@ BOOL NTAPI RtlFreeLdrDataTableEntry(_In_ PLDR_DATA_TABLE_ENTRY LdrEntry) {
 		// harmless no-ops rather than a second unlink that would corrupt the
 		// neighbours we already spliced out.
 		//
-		RemoveEntryList(&LdrEntry->InLoadOrderLinks);
-		RemoveEntryList(&LdrEntry->InMemoryOrderLinks);
-		RemoveEntryList(&LdrEntry->InInitializationOrderLinks);
-		InitializeListHead(&LdrEntry->InLoadOrderLinks);
-		InitializeListHead(&LdrEntry->InMemoryOrderLinks);
-		InitializeListHead(&LdrEntry->InInitializationOrderLinks);
+		// All of that runs under ntdll!LdrpModuleDatatableLock, which is the lock
+		// that guards these structures -- the loader lock does not. One section
+		// covers the unlink and the de-index because they are one logical
+		// operation, making the entry unreachable, and because that lock is an
+		// SRW lock and cannot be taken twice on one thread.
+		//
+		// RtlFreeDependencies is deliberately outside it: it calls LdrUnloadDll,
+		// which takes the same lock, so holding it there would self-deadlock. It
+		// is a no-op for our entries in any case, since we never populate
+		// DdagNode->Dependencies.
+		//
+		{
+			MmpDatatableLockGuard databaseLock;
 
-		RtlRemoveModuleBaseAddressIndexNode(LdrEntry);
+			RemoveEntryList(&LdrEntry->InLoadOrderLinks);
+			RemoveEntryList(&LdrEntry->InMemoryOrderLinks);
+			RemoveEntryList(&LdrEntry->InInitializationOrderLinks);
+			InitializeListHead(&LdrEntry->InLoadOrderLinks);
+			InitializeListHead(&LdrEntry->InMemoryOrderLinks);
+			InitializeListHead(&LdrEntry->InInitializationOrderLinks);
+
+			RtlRemoveModuleBaseAddressIndexNode(LdrEntry);
+		}
 
 		RtlFreeDependencies(entry);
 		RtlFreeHeap(heap, 0, entry->DdagNode);
@@ -356,6 +381,19 @@ VOID NTAPI RtlInsertMemoryTableEntry(_In_ PLDR_DATA_TABLE_ENTRY LdrEntry) {
 	//
 	LdrEntry->HashLinks.Flink = &LdrEntry->HashLinks;
 	LdrEntry->HashLinks.Blink = &LdrEntry->HashLinks;
+
+	//
+	// These three lists are guarded by ntdll!LdrpModuleDatatableLock, not by the
+	// loader lock. Splicing them under the loader lock alone is what produced
+	// FAST_FAIL_CORRUPT_LIST_ENTRY inside ntdll's own LdrpInsertDataTableEntry:
+	// two concurrent tail inserts lose one update and leave
+	// head->Blink->Flink != head, which is exactly what ntdll validates.
+	//
+	// The section is deliberately just the three splices. The lock is an SRW
+	// lock and therefore not recursive, so nothing that can re-enter the loader
+	// may run inside it.
+	//
+	MmpDatatableLockGuard databaseLock;
 
 	/* Insert into other lists */
 	InsertTailList(&PebData->InLoadOrderModuleList, &LdrEntry->InLoadOrderLinks);

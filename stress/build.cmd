@@ -124,6 +124,21 @@ if errorlevel 1 (
     exit /b 1
 )
 
+echo === building lockprobe ===
+rem
+rem Locates and verifies ntdll!LdrpModuleDatatableLock at runtime. Standalone on
+rem purpose: it links nothing from this tree, so it can be copied to another
+rem machine on its own. See X64-DATA-REQUEST.md.
+rem
+cl /nologo /std:c++17 /O2 /MT /EHsc ^
+    /Fo"%OUT%\lockprobe.obj" /Fd"%OUT%\lockprobe.pdb" ^
+    "%~dp0lockprobe.cpp" ^
+    /link /OUT:"%OUT%\lockprobe.exe"
+if errorlevel 1 (
+    echo error: lockprobe build failed.
+    exit /b 1
+)
+
 rem
 rem Diagnostic variants. These are byte-identical copies of stress.exe; the only
 rem thing that differs is the file name, which is what gflags keys its Image File

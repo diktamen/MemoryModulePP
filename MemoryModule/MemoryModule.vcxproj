@@ -78,6 +78,7 @@
     <ClCompile Include="InvertedFunctionTable.cpp" />
     <ClCompile Include="LdrEntry.cpp" />
     <ClCompile Include="BaseAddressIndex.cpp" />
+    <ClCompile Include="ModuleDatatableLock.cpp" />
     <ClCompile Include="ReflectiveLoader.c">
       <SupportJustMyCode Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">false</SupportJustMyCode>
       <SupportJustMyCode Condition="'$(Configuration)|$(Platform)'=='Debug|ARM'">false</SupportJustMyCode>
@@ -148,6 +149,7 @@
     <ClInclude Include="MmpTls.h" />
     <ClInclude Include="Loader.h" />
     <ClInclude Include="BaseAddressIndex.h" />
+    <ClInclude Include="ModuleDatatableLock.h" />
     <ClInclude Include="InvertedFunctionTable.h" />
     <ClInclude Include="LdrEntry.h" />
     <ClInclude Include="MmpTlsp.h" />

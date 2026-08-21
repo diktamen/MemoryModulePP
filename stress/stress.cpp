@@ -66,6 +66,22 @@ typedef int(*PFN_StressPing)(int);
 
 typedef NTSTATUS(NTAPI* PFN_LdrLockLoaderLock)(ULONG, ULONG*, PVOID*);
 typedef NTSTATUS(NTAPI* PFN_LdrUnlockLoaderLock)(ULONG, PVOID);
+typedef VOID(NTAPI* PFN_SRW)(PVOID);
+
+//
+// ntdll!LdrpModuleDatatableLock, which is what actually guards the three
+// PEB->Ldr lists. Not exported by ntdll, so it is taken from the DLL under
+// test: it locates the lock and exports the RVA it found. Resolved in main().
+//
+// This matters for the integrity check below. Walking those lists under
+// LdrLockLoaderLock does not exclude ntdll's own splices, so the walk could
+// observe a genuine mid-splice tear and report it as corruption -- a false
+// positive that made the "soft failure" count untrustworthy. Reading them under
+// the right lock, shared, is sound.
+//
+static PVOID    g_datatableLock = nullptr;
+static PFN_SRW  g_acquireShared = nullptr;
+static PFN_SRW  g_releaseShared = nullptr;
 
 static PFN_LoadLibraryMemoryExW g_loadMemory = nullptr;
 static PFN_FreeLibraryMemory    g_freeMemory = nullptr;
@@ -154,8 +170,18 @@ static bool CheckLoaderIntegrity(std::string& detail) {
     ULONG disposition = 0;
     PVOID cookie = nullptr;
     bool held = false;
+    bool sharedHeld = false;
 
-    if (g_lockLoader && g_lockLoader(0, &disposition, &cookie) >= 0 && disposition == 1) {
+    //
+    // Prefer the lock that actually guards these lists. Fall back to the loader
+    // lock only when testing a DLL that cannot tell us where it is, in which
+    // case this check keeps its old, unsound behaviour rather than none at all.
+    //
+    if (g_datatableLock && g_acquireShared) {
+        g_acquireShared(g_datatableLock);
+        sharedHeld = true;
+    }
+    else if (g_lockLoader && g_lockLoader(0, &disposition, &cookie) >= 0 && disposition == 1) {
         held = true;
     }
 
@@ -170,7 +196,10 @@ static bool CheckLoaderIntegrity(std::string& detail) {
         ok = false;
     }
 
-    if (held && g_unlockLoader) {
+    if (sharedHeld && g_releaseShared) {
+        g_releaseShared(g_datatableLock);
+    }
+    else if (held && g_unlockLoader) {
         g_unlockLoader(0, cookie);
     }
 
@@ -426,6 +455,21 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    //
+    // Take the address of ntdll!LdrpModuleDatatableLock from the DLL under test,
+    // which located it during its own initialization. Used only to make the
+    // integrity check below read the loader lists under the correct lock.
+    //
+    {
+        auto rva = (volatile LONG*)GetProcAddress(mm, "MmpModuleDatatableLockRva");
+        auto located = (volatile LONG*)GetProcAddress(mm, "MmpModuleDatatableLockLocated");
+        g_acquireShared = (PFN_SRW)GetProcAddress(ntdll, "RtlAcquireSRWLockShared");
+        g_releaseShared = (PFN_SRW)GetProcAddress(ntdll, "RtlReleaseSRWLockShared");
+        if (rva && located && *located && *rva && g_acquireShared && g_releaseShared) {
+            g_datatableLock = (PVOID)((BYTE*)ntdll + *rva);
+        }
+    }
+
     size_t imageSize = 0;
     PVOID image = ReadFileIntoMemory(payloadPath, &imageSize);
     if (!image) {
@@ -520,6 +564,29 @@ int main(int argc, char** argv) {
         auto failures = (volatile LONG*)GetProcAddress(mm, "MmpLoaderLockAcquireFailures");
         if (failures) printf("  loaderlock acq failures: %ld\n", *failures);
         else printf("  loaderlock acq failures: (not exported)\n");
+    }
+
+    //
+    // Whether the datatable lock is actually in play. A clean run means nothing
+    // unless "located" is 1 and "acquires" tracks the load count -- otherwise
+    // every guard was a no-op and the run proved only that the race is
+    // probabilistic.
+    //
+    {
+        auto located = (volatile LONG*)GetProcAddress(mm, "MmpModuleDatatableLockLocated");
+        auto acquires = (volatile LONG*)GetProcAddress(mm, "MmpModuleDatatableLockAcquires");
+        auto skipped = (volatile LONG*)GetProcAddress(mm, "MmpModuleDatatableLockSkipped");
+        auto rva = (volatile LONG*)GetProcAddress(mm, "MmpModuleDatatableLockRva");
+        if (located) {
+            printf("  datatable lock    : %s", *located ? "LOCATED" : "NOT LOCATED (guards are no-ops)");
+            if (*located && rva) printf(" at ntdll+0x%lX", (unsigned long)*rva);
+            printf("\n");
+            if (acquires) printf("  datatable acquires: %ld\n", *acquires);
+            if (skipped && *skipped) printf("  datatable skipped : %ld\n", *skipped);
+        }
+        else {
+            printf("  datatable lock    : (not exported -- old build under test)\n");
+        }
     }
 
     long long bad = g_loadFailures.load() + g_unloadFailures.load() +

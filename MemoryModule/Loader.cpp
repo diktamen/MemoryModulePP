@@ -121,9 +121,26 @@ NTSTATUS NTAPI LdrLoadDllMemoryExW(
 
 	if (DllName) {
 		int length = (int)wcslen(DllName);
-		PLIST_ENTRY ListHead = &NtCurrentPeb()->Ldr->InLoadOrderModuleList, ListEntry = ListHead->Flink;
 		PIMAGE_NT_HEADERS h1 = RtlImageNtHeader(BufferAddress), h2 = nullptr;
 		if (!h1)return STATUS_INVALID_IMAGE_FORMAT;
+
+		//
+		// InLoadOrderModuleList is guarded by ntdll!LdrpModuleDatatableLock, so
+		// reading it needs that lock and not the loader lock. Without it this
+		// walk can observe the list mid-splice while any other thread loads a
+		// DLL, which is also why the harness's own integrity check was seeing
+		// tears that were not corruption.
+		//
+		// Nothing in the loop re-enters the loader: it reads image headers and
+		// our own MEMORYMODULE, and adjusts a reference count. That matters
+		// because this lock is an SRW lock and is not recursive. It is released
+		// at the end of this block, well before MemoryLoadLibrary and import
+		// resolution below, both of which call LoadLibrary and would deadlock
+		// against it.
+		//
+		MmpDatatableLockGuard databaseLock;
+
+		PLIST_ENTRY ListHead = &NtCurrentPeb()->Ldr->InLoadOrderModuleList, ListEntry = ListHead->Flink;
 		
 		while (ListEntry != ListHead) {
 			PLDR_DATA_TABLE_ENTRY CurEntry = CONTAINING_RECORD(ListEntry, LDR_DATA_TABLE_ENTRY, InLoadOrderLinks);

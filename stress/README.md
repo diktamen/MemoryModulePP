@@ -1,7 +1,24 @@
 # Loader stress harness
 
 A bench for MemoryModulePP's concurrency behaviour, and a record of the bug
-currently being hunted with it.
+hunted with it.
+
+**Status: the `0xC0000409` fast-fail is root-caused and fixed on arm64.** We were
+splicing ntdll's loader lists while holding `LdrpLoaderLock`; ntdll splices them
+while holding `LdrpModuleDatatableLock`. Two different locks, so no mutual
+exclusion, so a lost tail update. Taking the right lock takes 8+8 from 18/24
+clean to **24/24**, and 24+12 from 2-6/12 to the numbers in "After the fix"
+below. x64 is deliberately unchanged for now and still has the bug; see
+`X64-DATA-REQUEST.md`.
+
+Jump to "The wrong lock" for the disassembly and "After the fix" for the
+measurements. Everything before those is the trail that led there, kept because
+two of its conclusions were confidently wrong and the corrections are the useful
+part.
+
+**If you only want to know what is still broken, read `../OPEN-ISSUES.md`
+instead.** This file is the investigation log and it reads like one; that file is
+the short, ordered list of what remains open and how each one would show up.
 
 The library was written single-threaded and its upstream author says so plainly
 (bb107/MemoryModulePP#58: "I really didn't consider multithread safety when
@@ -31,11 +48,13 @@ So roughly a quarter of runs fail at 8+8, and about half at 24+12. The same
 which is the sampling trap again in a new guise: the slower environment simply
 does not generate enough contention to expose the rate.
 
-Two distinct open defects:
+Two distinct defects:
 
-1. **`__fastfail`, exit `0xC0000409`** -- ntdll's own list validation, detailed
-   below. Reproduces on native arm64 as well as x64, so it is a real logic bug
-   and not an emulation artifact.
+1. **`__fastfail`, exit `0xC0000409`** -- ntdll's own list validation.
+   **Root-caused: we hold the wrong lock.** See "The wrong lock" below. Not a
+   lifetime bug and not an emulation artifact; it is an ordinary data race
+   between our list splices and ntdll's, which no amount of entry-lifetime
+   auditing was ever going to find.
 2. **A rare wrong answer from the payload**, about 1 ping in 1600. With the TLS
    payload `StressPing` round-trips through `thread_local`, so a wrong result
    means this module's TLS was not correct for that thread on that call. Much
@@ -60,7 +79,14 @@ This is **ntdll fast-failing on its own list validation**, on a noise thread
 doing an ordinary `LoadLibraryExW`, while inserting an unrelated module. Not one
 of MemoryModulePP's own `__fastfail` calls. It means a list in ntdll's loader
 database is inconsistent, and since the only foreign entries in those lists are
-the ones we fabricate, we are still corrupting something.
+the ones we fabricate, we are corrupting something.
+
+We are. The mechanism is in "The wrong lock" two sections down: we splice those
+lists under `LdrpLoaderLock` while ntdll splices them under
+`LdrpModuleDatatableLock`, so the two never exclude each other and a lost tail
+update leaves exactly the inconsistency reported here. The section below on what
+ntdll validates is still accurate and worth reading first, but it describes the
+*check*, not the cause.
 
 ### What ntdll is actually checking
 
@@ -85,19 +111,468 @@ offset does not say which; the x64 build faulted at `+0x12c`, deeper in its
 version of the function, which suggests one of the two module lists rather than
 the hash bucket.
 
-That reframes the search. We still insert into and remove from both module
-lists, and those edits are provably under the loader lock, so the leading
-hypothesis is now that one of our entries is still reachable as a list tail at a
-moment when it should not be -- freed, or unlinked incompletely -- rather than
-that any individual splice races.
+### The wrong lock
+
+**`LdrLockLoaderLock` does not protect the loader database.** It never did on
+this Windows generation. Everything below is from `cdb` against
+ntdll 10.0.26100.8972 with the public PDB; RVAs are for that build.
+
+Modern ntdll has **two** loader locks, and they are disjoint objects:
+
+| Symbol | Type | RVA | Guards |
+| --- | --- | --- | --- |
+| `ntdll!LdrpLoaderLock` | `CRITICAL_SECTION` | `0x3886A0` | running init routines: `DllMain`, thread attach/detach |
+| `ntdll!LdrpModuleDatatableLock` | `SRWLOCK` | `0x3929E0` | **the loader database**: the three `PEB->Ldr` lists, `LdrpHashTable` (`0x392DE0`), the module base-address index |
+
+Note the spelling ntdll uses: *Datatable*, not Database.
+
+The chain that proves it:
+
+1. `LdrLockLoaderLock` -- the only loader lock ntdll exports, and the one
+   `MmpLoaderLockGuard` calls -- tail-calls `LdrpAcquireLoaderLock`, which does
+   `adrp x8,#0x…678000` / `add x0,x8,#0x6A0` then
+   `bl ntdll!RtlEnterCriticalSection`. That address is exactly
+   `ntdll!LdrpLoaderLock`. So we take the critical section.
+
+2. `LdrpInsertDataTableEntry`, the function that fast-fails, **takes no lock at
+   all.** The entire function contains one `bl` (to `LdrpHashUnicodeString`) and
+   one `brk #0xF003`. It is a lock-held helper, in the same family as the
+   `…LockHeld`-suffixed symbols next to it in the export walk
+   (`LdrpInsertModuleToIndexLockHeld`, `LdrpFindLoadedDllByNameLockHeld`).
+
+3. Its caller `LdrpMapDllWithSectionHandle` acquires
+   `LdrpModuleDatatableLock` exclusive, via the inlined SRW fast path --
+   `add x23,x8,#0x9E0` then `ldsetab w8,w8,[x23]`, branching to the contended
+   path if bit 0 was already set -- and drops it with
+   `RtlReleaseSRWLockExclusive`. Immediately inside that lock it reads
+   `BaseNameHashValue` at `+0x108` and masks `hash & 0x1F` to pick the
+   `LdrpHashTable` bucket: the exact sequence disassembled above, now with the
+   lock visible around it.
+
+4. **Nothing on the crash-stack path takes the legacy lock.** `LdrLoadDll`,
+   `LdrpLoadDllInternal` and `LdrpDrainWorkQueue` each contain **zero** calls to
+   `LdrpAcquireLoaderLock`. The legacy lock's remaining job is initialization:
+   `LdrpPrepareModuleForExecution`, `LdrpInitializeThread` and
+   `LdrShutdownThread` take it, and none of those touch the datatable lock.
+
+5. `LdrUnloadDll` is the only one that takes both, and it takes them
+   **sequentially, not nested**: acquire datatable lock, release it, then
+   acquire the legacy loader lock. So the datatable lock is a short leaf-level
+   lock held only across database mutation.
+
+So `MmpLoaderLockGuard` buys mutual exclusion against `DllMain` and thread
+notifications, and against nothing else. **Every `InsertTailList` and
+`RemoveEntryList` we perform on the `PEB->Ldr` lists, and every mutation of the
+base-address index, races ntdll's own splices.** Two threads doing a concurrent
+tail insert lose one of the two updates, and the loser leaves
+`head->Blink->Flink != head` -- which is precisely, and only, what ntdll
+reported.
+
+This is worth stating plainly because the counter-evidence was so convincing:
+`MmpLoaderLockAcquireFailures` reading 0 over thousands of loads proves the lock
+was *acquired*, and says nothing whatever about whether the access was
+*synchronized*. A contention count of 4250 on `LdrpLoaderLock` reinforced the
+illusion, but that traffic is `DllMain` and thread attach, not list maintenance.
+
+It also retires the entire lifetime line of inquiry, and explains the two
+partial fixes as what they actually were:
+
+- Dropping the `LdrpHashTable` insert **halved** the rate because it removed one
+  of four unsynchronized splices per load. A linear reduction in racing writes,
+  not a logic fix -- which is exactly what the 7/8-against-5/8 measurement was
+  telling us, and why it looked like a cure at small samples.
+- The `DdagNode` unlink-before-free fix (9/16 to 27/32) fixed a real
+  use-after-free that was a second, independent bug. It could not cure this one.
+- The rate tracking contention -- 8x more failures on native arm64, none at
+  `--threads 0` -- is the signature of a data race, not of a lifetime error.
+
+**What this does not yet establish.** Taking `LdrpModuleDatatableLock` is
+*necessary*; it is not proven *sufficient*. Our entries still have to satisfy
+every other invariant ntdll keeps over a database it believes it allocated --
+the DDAG state machine, the work queue, and whatever `LdrpHashTable` wanted that
+we could not honour. Given how often this investigation has mistaken an
+improvement for a cure, that has to be measured, not assumed. And the lock is
+not exported: reaching it means locating an internal ntdll data symbol, the same
+fragile technique that `LdrpInvertedFunctionTable` had to be abandoned for. See
+"Two ways out" below.
+
+### Baseline at the time of this finding
+
+`HEAD` = `15895c6`, native arm64, mixed mode, 8 loaders + 8 noise, 200
+iterations, 24 runs, exit codes captured exactly:
+
+```
+18/24 clean   2 soft (exit 1)   4 fast-fail (0xC0000409)
+```
+
+A 17% fast-fail rate, agreeing closely with the 15/20 recorded earlier, which is
+the first time two independent samples in this investigation have agreed.
+
+### Getting the lock: `lockprobe`
+
+`lockprobe.cpp` locates `LdrpModuleDatatableLock` at runtime with **no
+hardcoded RVA, no PDB, and no opcode signature for the function itself**, and
+then proves the answer before anyone trusts it. `build.cmd` builds it.
+
+The trick is that both ends of the pattern are things `GetProcAddress` can
+resolve. Several *exported* ntdll functions acquire the lock by calling the
+*exported* `RtlAcquireSRWLockShared`/`Exclusive`, and the ABI puts the lock
+pointer in the first argument. So the only thing decoded is the single
+instruction that materialises that argument:
+
+```
+adrp x21, #page
+add  x0, x21, #0x9E0        <- first argument
+bl   ntdll!RtlAcquireSRWLockExclusive
+```
+
+Three exported donors have that shape: `LdrQueryModuleServiceTags` (exclusive),
+`LdrDisableThreadCalloutsForDll` and `LdrGetDllHandleByMapping` (both shared).
+`LdrAddRefDll` and `LdrGetDllFullName` reference the lock too but inline the
+acquire, so they are kept in the donor list only in case x64 differs.
+
+Two donors must agree, and then the address has to survive a **causality
+test**, which is what makes this safe to ship rather than merely clever: hold
+the candidate exclusively and an ordinary `LoadLibrary` on another thread must
+block, and must complete the moment it is released. A wrong address cannot pass
+that. Measured on this host:
+
+```
+LdrQueryModuleServiceTags        -> ntdll+0x3929E0
+LdrDisableThreadCalloutsForDll   -> ntdll+0x3929E0
+LdrGetDllHandleByMapping         -> ntdll+0x3929E0
+donors decoded: 3 of 5, agreeing: 3
+while held    : LoadLibrary blocked      (expected)
+after release : LoadLibrary completed    (expected)
+RESULT: VERIFIED
+```
+
+That matches the symbol-derived RVA exactly, by an entirely independent route.
+
+**The x64 decoder is unproven.** On this ARM64X host every one of those exports,
+seen from an x64 process, is an ARM64EC fast-forward thunk
+(`48 8B C4 48 89 58 20 55 5D E9 …`) with no x64 body behind it, so the x64 path
+cannot be exercised here at all -- the probe detects the thunks and fails safe,
+which is the correct behaviour but not a test. `X64-DATA-REQUEST.md` says what
+to collect on a genuine x64 box to close this.
+
+**Lock ordering is safe, and that was checked rather than assumed.** Of the
+loader functions that reference the datatable lock, only `LdrUnloadDll` and
+`LdrpDecrementModuleLoadCountEx` also take the legacy lock, and both take them
+**sequentially, not nested**: acquire datatable, release it, *then* acquire
+legacy. So ntdll never holds datatable while wanting legacy, and our nesting
+legacy → datatable cannot close a cycle.
+
+**`LdrpModuleDatatableLock` is an SRW lock, so it is not recursive**, unlike the
+legacy critical section. That constrains the fix more than the ordering does:
+the sections we hold it across must never re-enter ntdll's loader. In
+particular it must **not** be held across `MemoryResolveImportTable` (which
+calls `LoadLibrary`), `MemoryFreeLibrary` (which calls `FreeLibrary`), DllMain,
+or `RtlFreeDependencies` (which calls `LdrUnloadDll`) -- each of those would
+self-deadlock instantly. ntdll's own TLS routines are clear: `LdrpHandleTlsData`
+and `LdrpReleaseTlsEntry` take `LdrpTlsLock` and never the datatable lock.
+
+So the shape of the fix is a narrow critical section per mutation, not a wider
+lock: keep the recursive legacy lock for the coarse check-then-act window that
+the duplicate-module scan needs, and take the datatable lock only around the
+list splices themselves, the base-address index edits, and the list walks --
+mirroring what ntdll does.
+
+### After the fix
+
+Taking `LdrpModuleDatatableLock` around the database mutations is implemented on
+arm64 in `MemoryModule/ModuleDatatableLock.{h,cpp}`, with narrow sections at four
+sites: the three `InsertTailList` calls in `RtlInsertMemoryTableEntry`, the
+unlink-and-de-index block in `RtlFreeLdrDataTableEntry`, the base-address index
+insert in `RtlInitializeLdrDataTableEntry`, and the duplicate-module scan's walk
+of `InLoadOrderModuleList` in `LdrLoadDllMemoryExW`.
+
+**Confirm it is actually on before believing any run.** The harness prints
+`datatable lock : LOCATED at ntdll+0x…` and an acquisition count. If it says
+`NOT LOCATED (guards are no-ops)` then the guards did nothing and a clean run
+proves only that the race is probabilistic. Typical numbers: about 2.6
+acquisitions per memory load, so 4,174 for 1,600 loads at 8+8, and 12,015 for
+4,800 loads at 24+12.
+
+Measured with a **same-session A/B**, which is the discipline this document had
+to learn twice. `MMPP_NO_DATATABLE_LOCK` builds the identical source with the
+decoder compiled out, so the control is byte-for-byte the same library with the
+lock never located and every guard a no-op:
+
+The headline run is 48 pairs at 8+8, **interleaved** so any machine drift hits
+both sides equally:
+
+```
+8 loaders + 8 noise, 200it, 48 runs a side, interleaved
+  control  31 clean   5 soft   11 fast-fail (0xC0000409)   1 heap corruption (0xC0000374)
+  fixed    47 clean   1 soft    0 fast-fail                0 heap corruption
+```
+
+11 fast-fails in 48 against 0 in 48 is p of roughly 4e-6. The control also threw
+one `0xC0000374`, which is the heap corruption this bench chased earlier and
+which the fix also removes -- consistent with list corruption being the upstream
+cause of it rather than a separate defect.
+
+Smaller sets, run before that one, agree:
+
+```
+8 loaders + 8 noise, 200it, 24 runs
+  control  19 clean   3 soft   2 fast-fail
+  fixed    24 clean   0 soft   0 fast-fail
+
+24 loaders + 12 noise, 200it, 12 runs
+  control   8 clean   3 soft   1 fast-fail
+  fixed    11 clean   1 soft   0 fast-fail
+```
+
+And the same A/B run as **x64 on this ARM64X host**, which is the x64-JDK-on-arm64
+configuration:
+
+```
+12 loaders + 8 noise, 200it, 10 runs a side, interleaved, x64 emulated
+  control   8 clean   0 soft   2 fast-fail
+  fixed    10 clean   0 soft   0 fast-fail
+```
+
+Treat that one as confirmatory, not conclusive: 2 against 0 in ten runs a side is
+not significant on its own, and emulated x64 runs roughly 8x slower so it
+generates far less contention than native arm64. What it does establish is that
+the bug is real in that configuration -- the control reproduces it -- and that
+the ARM64EC lock is the right one, which the causality check had already shown
+independently.
+
+Across every A/B above: **0 fast-fails in 94 runs with the lock, 16 in 94
+without it.**
+
+**The remaining `soft` failures are the other defect, not this one.** The single
+soft failure at 24+12 was one wrong ping in 4,800 with zero list-corruption
+fast-fails, zero integrity failures and zero load or unload failures. That is
+defect 2 at the top of this document -- the payload's `thread_local` round-trip
+occasionally returning the wrong answer -- and nothing in this change addresses
+it. Do not read it as residual list corruption.
+
+**A note on run times.** Do not compare the 6-7s seen here at 24+12 against the
+110s recorded in the deadlock correction below. That figure was measured on the
+emulated x64 build, most likely with page heap enabled, so it is not the same
+environment and there is no performance claim to make either way.
+
+**The harness's integrity check is now sound.** It used to walk the lists under
+`LdrLockLoaderLock`, which does not exclude ntdll's splices, so it could report a
+transient mid-splice tear as corruption. It now takes the datatable lock
+*shared*, using the RVA the DLL under test exports, and falls back to the old
+behaviour only when testing a library that cannot tell it where the lock is.
+That is why the `soft` counts above are trustworthy where earlier ones were not.
+
+### x64, and x64-on-arm64
+
+All three configurations now locate the lock. The third one matters most in
+practice: **an x64 process on ARM64 Windows**, which is what an x64 JDK on an
+arm64 machine is.
+
+| Configuration | Decoded via | Lock |
+| --- | --- | --- |
+| native arm64, 10.0.26100 | `arm64` | `ntdll+0x3929E0` |
+| native x64, ~Win10 1709 | `x64` | `ntdll+0x1D1478` |
+| native x64, ~6.3 / 2012 R2 | `x64` | `ntdll+0x175AC0` |
+| **x64 on ARM64X, 10.0.26100** | `arm64ec` | `ntdll+0x38E930` |
+
+The x64-on-ARM64X case needed two things beyond the plain decoders, and produced
+the most surprising result in this whole investigation.
+
+**The export is a thunk, and the code behind it is ARM64.** On ARM64X an x64
+caller's `GetProcAddress` returns an ARM64EC fast-forward sequence
+(`48 8B C4 48 89 58 20 55 5D E9 <rel32>`), not an x64 body. Following the `jmp`
+lands on the ARM64EC compilation of the function, which is ARM64 instructions.
+So an **x64 binary has to be able to read ARM64**, which is why both decoders are
+compiled into both builds.
+
+**The ARM64EC build hides the acquire two calls deep.** Native ARM64 ntdll loads
+the lock and calls the SRW acquire inside the exported function. The ARM64EC
+compilation instead routes through a dedicated
+`LdrpAcquireModuleDatatableLock` helper: `LdrQueryModuleServiceTags` calls it
+directly, but `LdrAddRefDll`, `LdrGetDllFullName` and the rest reach it only via
+`LdrpFindLoadedDllByHandle` or `LdrpDereferenceModule` first. Hence the
+depth-limited recursion into callees, which is used only on the ARM64EC path.
+
+**And the ARM64EC view uses a different lock object than the native view of the
+same ntdll** -- `ntdll+0x38E930` against `ntdll+0x3929E0`. That is not a decoding
+error. An ARM64X image is effectively two ntdlls merged behind one export table,
+and a given process runs one view throughout, so each view having its own lock
+is consistent. It is exactly the kind of thing that would have been impossible to
+guess, and it is why the causality check earns its place: it confirmed
+`0x38E930` is the lock an ordinary `LoadLibrary` actually blocks on **from an x64
+process on this host**, which no amount of reading would have settled.
+
+An earlier version of this section claimed the ARM64EC path was a dead end,
+because following the thunk appeared to land in unrelated telemetry code. That
+was arithmetic error on my part, not a property of ntdll -- the thunk lands
+exactly on `ntdll!#LdrQueryModuleServiceTags`. Recompute before concluding a
+path is closed.
+
+Five configurations measured across four machines. The `ntdll` column is the PE
+`TimeDateStamp`, used purely as an opaque build identifier -- **do not read these
+as dates.** Modern Windows binaries use a reproducible-build hash there, and an
+earlier version of this table mistakenly dated the Server 2022 box to 2014 by
+doing exactly that.
+
+| ntdll build | SizeOfImage | running as | lock RVA | donors |
+| --- | --- | --- | --- | --- |
+| `0x105BCDDA` (10.0.26100) | `0x437000` | native ARM64 | `0x3929E0` | 3 of 5 |
+| `0x105BCDDA` (10.0.26100) | `0x437000` | x64 on ARM64X | `0x38E930` | 2 of 5 |
+| `0x534DA4B0` (Server 2022, 20348) | `0x205000` | native x64 | `0x175AC0` | 2 of 5 |
+| `0x59A29EB0` | `0x266000` | native x64 | `0x1D1478` | 4 of 5 |
+| `0x6A51BE80` | `0x1D3000` | native x64 | `0x153130` | 3 of 5 |
+
+Which donors decode, per configuration:
+
+| Donor | ARM64 | x64/ARM64X | x64 `534D` | x64 `59A2` | x64 `6A51` |
+| --- | --- | --- | --- | --- | --- |
+| `LdrQueryModuleServiceTags` | yes | yes | yes | yes | yes |
+| `LdrGetDllHandleByMapping` | yes | yes | no | yes | yes |
+| `LdrAddRefDll` | no | no | yes | yes | yes |
+| `LdrGetDllFullName` | no | no | no | yes | no |
+| `LdrDisableThreadCalloutsForDll` | yes | no | no | no | no |
+
+Two things that fall out of this, both load-bearing:
+
+**The usable donors are nearly disjoint, and only one works everywhere.**
+`LdrQueryModuleServiceTags` decodes in all five configurations; every other entry
+fails in at least two, and `LdrGetDllFullName` and
+`LdrDisableThreadCalloutsForDll` each work in exactly one. The rest inline the
+acquire where they fail, leaving no call to anchor on. `LdrAddRefDll` had been
+left out of the library's donor list on the grounds that it was undecodable --
+true on arm64, wrong on all three native x64 builds -- which would have left
+exactly one donor on the Server 2022 box, below the two-donor minimum, and the
+capability silently off. **The donor list is the union of all of them and must
+not be trimmed to whatever works on the machine in front of you.** Two of the
+five configurations clear the minimum with nothing to spare, so if a future build
+inlines one more the capability turns itself off: the intended direction, but it
+presents as the bug returning. The `datatable lock` line in the harness output is
+how you tell.
+
+Because the margin is that thin, donor disagreement is resolved by plurality
+rather than by rejecting everything, so one spurious decode cannot disable the
+feature. A tie, or a winner with fewer than two votes, still yields nothing.
+
+**Four configurations, four unrelated addresses.** Anything hardcoded would have
+been wrong in three of them, which is the whole argument for locating it at
+runtime -- and the two 10.0.26100 rows are the *same ntdll file* resolving to two
+different locks depending on whether the process is native or emulated.
+
+### Confirmed on genuine x64 hardware
+
+The last gap is closed. On a Windows Server 2022 box (build 20348, Intel Xeon,
+`PROCESSOR_ARCHITECTURE=AMD64`, 3 cores) the **library's own locator** reports
+`datatable lock : LOCATED at ntdll+0x175AC0` through the harness, with 6,000-odd
+acquisitions per run, and `lockprobe` there independently agrees and passes both
+its library-validation and causality checks.
+
+That also settles this document's longest-standing caveat -- that nothing had
+ever been confirmed on genuinely x64 silicon. **The fast-fail reproduces there,
+and the fix removes it:**
+
+```
+12 loaders + 8 noise, 200it, 14 runs a side, interleaved, native x64 Server 2022
+  control  12 clean   0 soft   2 fast-fail
+  fixed    11 clean   3 soft   0 fast-fail
+```
+
+The three soft failures on the fixed side are **not** a regression, and the
+asymmetry against the control's zero is small-sample noise. All three were
+`ping failures : 1` with zero load, unload and integrity failures, i.e. the
+unrelated TLS defect. A follow-up of 16 runs isolated it: 3 non-clean, every one
+a single wrong ping out of 2,400, and never an integrity failure. That is about 1
+in 12,800 pings on this box, rarer than the roughly 1 in 1,600 seen on arm64, and
+at that rate about 17% of runs should contain one -- which is what both sets show.
+The control's 0 of 14 is the mildly unlucky number here, not the fixed side's 3.
+
+Only 3 cores, so this box generates little contention and is weak for rate
+comparisons; its value is being real x64 silicon.
+
+### The road not taken
+
+Option 1 below is what shipped, and is described in "After the fix" above. The
+alternative is recorded because it is still the stronger long-term answer and
+this fix does not close it off.
+
+1. **Take `LdrpModuleDatatableLock` as well.** *Done, arm64 only.* Smallest
+   change, keeps every feature. Costs, all still live: the lock is located rather
+   than imported, so it needs the validation gate and the no-op fallback it now
+   has; the x64 decoder is unproven; and it remains necessary-not-sufficient, in
+   that our fabricated entries still have to satisfy every other invariant ntdll
+   keeps over a database it believes it allocated.
+
+2. **Stop publishing into ntdll's database at all.** Keep the fabricated
+   `LDR_DATA_TABLE_ENTRY` -- `LdrpHandleTlsData` needs the struct -- but link it
+   into nothing: no `PEB->Ldr` lists, no hash table, no base-address index.
+   Resolve exports from our own parsed PE instead of via `GetProcAddress`, and
+   keep publishing unwind info through `RtlAddFunctionTable`. That deletes the
+   entire bug class rather than synchronizing it. Costs: the OS loader APIs stop
+   seeing memory modules, and debuggers and profilers no longer enumerate them.
+
+Both `RtlAddFunctionTable` and the dropped hash-table insert were this same
+shape -- stop hand-maintaining an ntdll internal, either delegate to a
+documented API or give up the feature -- and both worked. That is the strongest
+prior available here.
+
+### Other defects found in the same pass
+
+None of these is the fast-fail, and none is exercised by the harness as it
+stands. Recorded so they are not re-discovered.
+
+1. **`MmpLoaderLockGuard` still gives up.** `LoaderPrivate.h` retries 64 times
+   and then proceeds with `Held == false`. In practice
+   `MmpLoaderLockAcquireFailures` has always read 0, so this has never fired --
+   but the fallback is "splice ntdll's lists unlocked", which is the one thing
+   the comment above it says must never happen. It should fail the load instead.
+   Note this is now a *robustness* issue rather than the cause: with the wrong
+   lock, `Held == true` was never sufficient anyway.
+
+2. **`ImportTable.cpp` unlinks the wrong node.**
+   `RemoveHeadList(&resolver->InMmpIatResolverList)` removes
+   `resolver->...Flink` -- the *next* entry -- and leaves `resolver` itself
+   linked, which is then freed on the following line. It should be
+   `RemoveEntryList`. Reachable only through the public
+   `MmRemoveImportTableResolver`, which nothing here calls, so it is latent, but
+   it is an unambiguous list corruption plus use-after-free.
+
+3. **`ReflectiveMapDll` publishes into ntdll with no lock at all.** It reaches
+   `LdrMapDllMemory` (three `InsertTailList` calls plus the base-address index)
+   and `RtlInsertInvertedFunctionTable` (a direct `.mrdata` edit, still live on
+   this path even though `RtlAddFunctionTable` replaced it everywhere else) with
+   no guard on the path, and never tears any of it down. Reachable in the DLL
+   build when `DllMain` sees `lpReserved == (PVOID)-1`.
+
+4. **Base-address index edge cases.** The equal-base branch returns
+   `STATUS_SUCCESS` without inserting, after which unload calls
+   `RtlRemoveModuleBaseAddressIndexNode` unconditionally and hands ntdll's
+   `RtlRbRemoveNode` a zeroed node whose null `ParentValue` reads as "I am the
+   root". Separately, if the `DdagNode` allocation fails after the node is
+   inserted, the entry is freed without removing the node, leaving ntdll's tree
+   pointing into a freed heap block. And the node is published into the tree
+   before `DllBase`, `SizeOfImage` and `DdagNode` are filled in.
+
+5. **`LdrpModuleBaseAddressIndex` discovery is conditional on tree colour.** The
+   scan is skipped unless ntdll's tree root happens to be black, so on some runs
+   discovery silently yields null and every memory load fails. Nondeterministic
+   capability rather than corruption, but it will look like a flaky bug.
+
+Checked and clean, so do not re-chase:
+
+| Hypothesis | Verdict |
+| --- | --- |
+| Our `LDR_DATA_TABLE_ENTRY` is too small for build 26100, so ntdll writes past the heap block | **False alarm.** `?? sizeof(ntdll!_LDR_DATA_TABLE_ENTRY)` is `0x138`, exactly `sizeof(LDR_DATA_TABLE_ENTRY_WIN11)`. Last field `HotPatchState` at `+0x130` in both. `sizeof(_LDR_DDAG_NODE)` is `0x50`. |
+| Lock-ordering inversion between the loader lock and the IAT resolver lock | Ordering is uniformly loader → IAT on every path. The only inversion needs `Held == false`, i.e. item 1 above. |
+
+### The elimination table, and the row that was wrong
 
 Eliminated so far, each with a measurement or a symbol dump behind it:
 
 | Hypothesis | How it was ruled out |
 | --- | --- |
-| We mutate the lists without the loader lock | `MmpLoaderLockAcquireFailures` is exported and reads 0 over thousands of loads |
+| ~~We mutate the lists without the loader lock~~ | **This row was wrong, and it cost the investigation the most.** `MmpLoaderLockAcquireFailures == 0` proves only that `LdrLockLoaderLock` succeeded. It is the wrong lock, so the mutations were unsynchronized the whole time. See "The wrong lock". |
 | Native loader cannot take this traffic | 72,094 native load/unload ops across 24 threads, zero failures |
-| Our `LDR_DATA_TABLE_ENTRY` layout is stale for this build | `dt ntdll!_LDR_DATA_TABLE_ENTRY` matches ours field for field to `HotPatchState` at `+0x130` |
+| Our `LDR_DATA_TABLE_ENTRY` layout is stale for this build | Confirmed twice: `dt` matches ours field for field to `HotPatchState` at `+0x130`, and `?? sizeof(ntdll!_LDR_DATA_TABLE_ENTRY)` is `0x138`, exactly `sizeof(LDR_DATA_TABLE_ENTRY_WIN11)` |
 | Our `LDR_DDAG_NODE` layout is wrong | `dt ntdll!_LDR_DDAG_NODE` matches ours field for field |
 | Claiming `InIndexes` while only being in one of two index trees | cleared it; 4/12 against 5/12, no effect |
 | `LdrpHashTable` insert | removing it roughly halved the rate, so it was *a* source but not the only one |
@@ -234,11 +709,25 @@ Three files: `stress.cpp` is the harness, `payload.cpp` the DLL it loads,
 `build.cmd` builds both plus the DLL under test.
 
 The harness does not only wait for crashes. After every check it walks all three
-`PEB->Ldr` module lists and verifies each node's `Flink`/`Blink` still agree,
-**holding the loader lock while it reads them**, which is the only way to read
-those lists safely while other threads load. A crossed or dropped link is
-reported when it happens rather than as an unrelated fault minutes later. A
-monitor thread runs this every 50ms, and once more at the end.
+`PEB->Ldr` module lists and verifies each node's `Flink`/`Blink` still agree. A
+crossed or dropped link is reported when it happens rather than as an unrelated
+fault minutes later. A monitor thread runs this every 50ms, and once more at the
+end.
+
+> **The integrity check is currently unsound, for the same reason the library
+> was.** `CheckLoaderIntegrity()` takes `LdrLockLoaderLock` and calls that
+> safe. Per "The wrong lock" above, that lock does not exclude ntdll's own list
+> mutations, so the walk can observe a genuine mid-splice tear that ntdll was
+> about to complete correctly. `InsertTailList` and `RemoveEntryList` are not
+> atomic, and a reader that does not hold `LdrpModuleDatatableLock` has no
+> right to expect a consistent view.
+>
+> Consequence for reading results: **the `soft` bucket is suspect.** Reported
+> integrity failures may be transient tears rather than corruption. The
+> `0xC0000409` fast-fails are not affected -- those are ntdll's own verdict on
+> its own structures -- so treat the fast-fail count as the trustworthy signal
+> until the checker is fixed to take the right lock. This is also why "soft"
+> and "fast-fail" have been counted separately above rather than summed.
 
 The payload is deliberately silent. The bundled `a.dll` printfs from `DllMain`,
 and stdout's lock would serialize the loader threads and hide the races. It still
@@ -341,3 +830,39 @@ one. Some of these reproduce 1-in-3.
 - For a hang: run free, wait, then attach non-invasively and dump every thread
   (`cdb -p <pid> -pv -c "~*kv 14; qd"`). Comparing those stacks across two builds
   is what exonerated the loader lock.
+
+### Reading ntdll directly, which is what finally worked
+
+The public PDB is enough to answer questions about ntdll's *own* locking, and
+that turned out to be worth more than every dynamic experiment in this document
+combined. The wrong-lock finding took four queries and no measurement:
+
+```
+set _NT_SYMBOL_PATH=srv*%LOCALAPPDATA%\Temp\symbols*https://msdl.microsoft.com/download/symbols
+cdb -c "x ntdll!Ldrp*Lock*; q" C:\Windows\System32\cmd.exe
+cdb -c "uf ntdll!LdrpInsertDataTableEntry; q" C:\Windows\System32\cmd.exe
+cdb -c "uf ntdll!LdrpMapDllWithSectionHandle; q" C:\Windows\System32\cmd.exe
+cdb -c "uf ntdll!LdrpAcquireLoaderLock; q" C:\Windows\System32\cmd.exe
+```
+
+`x ntdll!Ldrp*Lock*` is the one to run first. It lists every loader lock by
+name, and seeing `LdrpModuleDatatableLock` sitting next to `LdrpLoaderLock` is
+what made the whole thing obvious. Only the x64 `cdb` ships in this SDK
+installation, but the ARM64X ntdll carries both halves, so it disassembles the
+ARM64 code fine -- the prompt just reads `ARM64EC`.
+
+Useful conventions once you are in there: a `…LockHeld` suffix means the
+function asserts a caller-held lock and takes none itself, so **the lock you
+need is always in the caller**. An SRW acquire is usually inlined and looks like
+`ldsetab w8,w8,[xN]` with a branch to a contended path, not a `bl` -- grepping
+the disassembly for `bl.*Acquire` will miss it and did, at first.
+
+**A caution about "just do what LoadLibrary does".** Tracing to find out what
+ntdll requires is exactly right, and is how this was solved. Copying what ntdll
+*does* is a different proposition: the sequence it follows also drives the DDAG
+state machine, the loader work queue and `LdrpHashTable`, none of which is a
+stable contract, and the lock it uses is not exported. This project has tried
+that twice -- `LdrpInvertedFunctionTable` and `LdrpHashTable` -- and both times
+the fix was to stop imitating ntdll and either call a documented API or drop the
+feature. Trace to learn the constraint; then prefer the option that does not
+require honouring it.

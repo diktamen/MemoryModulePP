@@ -33,6 +33,9 @@
 //base address index
 #include "BaseAddressIndex.h"
 
+//ntdll!LdrpModuleDatatableLock, which is what actually guards the loader database
+#include "ModuleDatatableLock.h"
+
 //tls support
 #include "MmpTls.h"
 

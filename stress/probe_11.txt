@@ -1,0 +1,47 @@
+==================== lockprobe report ====================
+built for       : x64
+ntdll base      : 00007FF909220000
+ntdll machine   : 0x8664  (0x8664=x64, 0xAA64=ARM64)
+ntdll timestamp : 0x59A29EB0
+ntdll SizeOfImg : 0x00266000
+SRW acquire     : excl=00007FF90928B6C0 shared=00007FF90925CC20
+
+--- donors ---
+LdrQueryModuleServiceTags
+  addr          : 00007FF90937CF90  (ntdll+0x15CF90)
+  decoded via   : x64
+  LOCK          : 00007FF9093F1478  (ntdll+0x1D1478)
+
+LdrDisableThreadCalloutsForDll
+  addr          : 00007FF9093094D0  (ntdll+0xE94D0)
+  decoded via   : NO MATCH
+  first 48 bytes: 48 8B C4 48 89 58 08 57 48 83 EC 20 33 FF 40 38 
+                 3D 03 84 0E 00 8B DF 48 89 78 18 75 27 4C 8D 40 
+                 10 48 8D 50 18 E8 E6 2D F5 FF 8B D8 85 C0 78 14 
+
+LdrGetDllHandleByMapping
+  addr          : 00007FF90930A420  (ntdll+0xEA420)
+  decoded via   : x64
+  LOCK          : 00007FF9093F1478  (ntdll+0x1D1478)
+
+LdrAddRefDll
+  addr          : 00007FF9092ABAB0  (ntdll+0x8BAB0)
+  decoded via   : x64
+  LOCK          : 00007FF9093F1478  (ntdll+0x1D1478)
+
+LdrGetDllFullName
+  addr          : 00007FF909266EC0  (ntdll+0x46EC0)
+  decoded via   : x64
+  LOCK          : 00007FF9093F1478  (ntdll+0x1D1478)
+
+--- summary ---
+donors decoded  : 4 of 5
+agreeing        : 4
+candidate       : 00007FF9093F1478  (ntdll+0x1D1478)
+
+--- causality check ---
+  while held    : LoadLibrary blocked      (expected)
+  after release : LoadLibrary completed    (expected)
+
+RESULT: VERIFIED -- this is LdrpModuleDatatableLock
+==========================================================

@@ -18,6 +18,17 @@ VOID NTAPI RtlRbRemoveNode(
 	return decltype(&RtlRbRemoveNode)(MmpGlobalDataPtr->MmpBaseAddressIndex->_RtlRbRemoveNode)(Tree, Node);
 }
 
+//
+// Both of the routines below mutate ntdll's LdrpModuleBaseAddressIndex, and the
+// search in the first one reads nodes that ntdll may be rebalancing.
+//
+// The caller must hold ntdll!LdrpModuleDatatableLock -- see
+// ModuleDatatableLock.h. This mirrors ntdll's own convention for the same
+// structure, where the helper that does the work is named
+// LdrpInsertModuleToIndexLockHeld and takes no lock itself. Taking the guard
+// here instead would nest it inside the one RtlFreeLdrDataTableEntry holds
+// while unlinking, and an SRW lock is not recursive.
+//
 NTSTATUS NTAPI RtlInsertModuleBaseAddressIndexNode(
 	_In_ PLDR_DATA_TABLE_ENTRY DataTableEntry,
 	_In_ PVOID BaseAddress) {

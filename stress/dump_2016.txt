@@ -1,0 +1,65 @@
+==================== lockprobe report ====================
+built for       : x64
+ntdll base      : 00007FFDFEE50000
+ntdll machine   : 0x8664  (0x8664=x64, 0xAA64=ARM64)
+ntdll timestamp : 0x6A51BE80
+ntdll SizeOfImg : 0x001D3000
+SRW acquire     : excl=00007FFDFEE70BE0 shared=00007FFDFEE92640
+
+--- donors ---
+LdrQueryModuleServiceTags
+  addr          : 00007FFDFEF20800  (ntdll+0xD0800)
+  decoded via   : x64
+  LOCK          : 00007FFDFEFA3130  (ntdll+0x153130)
+  first 48 bytes: 48 8B C4 48 89 58 08 48 89 70 10 57 41 56 41 57 
+                 48 83 EC 30 4D 8B F0 4C 8B FA 4C 8D 40 20 48 8D 
+                 50 D8 E8 19 14 F6 FF 85 C0 78 5C 48 8D 0D FE 28 
+
+LdrDisableThreadCalloutsForDll
+  addr          : 00007FFDFEECDB30  (ntdll+0x7DB30)
+  decoded via   : NO MATCH
+  first 48 bytes: 48 89 5C 24 08 57 48 83 EC 20 33 FF 40 38 3D C5 
+                 48 0D 00 8B DF 75 29 4C 8D 44 24 38 48 8D 54 24 
+                 40 E8 EA 40 FB FF 8B D8 85 C0 78 14 48 8B 4C 24 
+
+LdrGetDllHandleByMapping
+  addr          : 00007FFDFEEC84A0  (ntdll+0x784A0)
+  decoded via   : x64
+  LOCK          : 00007FFDFEFA3130  (ntdll+0x153130)
+  first 48 bytes: 48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 30 48 
+                 8B F2 48 8B F9 4C 8D 4C 24 28 45 33 C0 48 8B D1 
+                 41 8D 48 01 E8 D7 C3 FB FF 8B D8 89 44 24 20 85 
+
+LdrAddRefDll
+  addr          : 00007FFDFEE89C10  (ntdll+0x39C10)
+  decoded via   : x64
+  LOCK          : 00007FFDFEFA3130  (ntdll+0x153130)
+  first 48 bytes: 48 89 5C 24 10 57 48 83 EC 20 48 8B C2 8B F9 F7 
+                 C1 FE FF FF FF 75 49 4C 8D 44 24 30 48 8B C8 48 
+                 8D 54 24 40 E8 07 80 FF FF 8B D8 85 C0 78 1D 40 
+
+LdrGetDllFullName
+  addr          : 00007FFDFEEC9B20  (ntdll+0x79B20)
+  decoded via   : NO MATCH
+  first 48 bytes: 4C 8B DC 49 89 5B 10 55 56 57 48 83 EC 20 33 F6 
+                 48 8B EA 49 21 73 18 48 85 C9 75 60 48 8B 05 85 
+                 83 0D 00 49 89 43 18 48 8D 78 48 65 48 8B 04 25 
+
+--- summary ---
+donors decoded  : 3 of 5
+agreeing        : 3
+candidate       : 00007FFDFEFA3130  (ntdll+0x153130)
+
+--- library-side validation ---
+  pointer-aligned : yes
+  inside ntdll    : yes (SizeOfImage 0x1D3000)
+  committed       : yes
+  writable        : yes (protect 0x4)
+  library verdict : WOULD ACCEPT
+
+--- causality check ---
+  while held    : LoadLibrary blocked      (expected)
+  after release : LoadLibrary completed    (expected)
+
+RESULT: VERIFIED -- this is LdrpModuleDatatableLock, and the library will use it
+==========================================================

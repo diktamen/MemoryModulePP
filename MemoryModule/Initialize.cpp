@@ -475,6 +475,15 @@ NTSTATUS InitializeLockHeld() {
 
 		MmpGlobalDataPtr->MmpLdrEntry->LdrpHashTable = FindLdrpHashTable();
 
+		//
+		// Locate ntdll!LdrpModuleDatatableLock, the lock that actually guards
+		// the loader database. Failure is not fatal here: the guards degrade to
+		// no-ops, which is the behaviour that shipped before, and the exported
+		// MmpModuleDatatableLockLocated says which way it went. Callers that
+		// need certainty should read that.
+		//
+		MmpInitializeModuleDatatableLock();
+
 		MmpGlobalDataPtr->MmpInvertedFunctionTable->LdrpInvertedFunctionTable = FindLdrpInvertedFunctionTable();
 
         MmpGlobalDataPtr->MmpFeatures = MEMORY_FEATURE_SUPPORT_VERSION | MEMORY_FEATURE_LDRP_HEAP | MEMORY_FEATURE_LDRP_HANDLE_TLS_DATA | MEMORY_FEATURE_LDRP_RELEASE_TLS_ENTRY;
