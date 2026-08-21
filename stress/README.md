@@ -12,14 +12,36 @@ instead of by reading.
 
 ## What is currently broken
 
-**Symptom.** `STATUS_HEAP_CORRUPTION` (`0xC0000374`). The process fast-fails, so
-nothing reaches the harness's unhandled-exception filter and there is no stack in
-the output. Only the exit code identifies it.
+**Where it stands.** Clean through 8 loader threads plus 8 noise threads.
+Marginal at 16 plus 8. Reliably broken at 24 plus 12, which is where work
+stopped.
 
-**Conditions required to reproduce.** Both of these, together:
+**The failure mode changed once, and that matters.** Until `00ed378` the 24-thread
+configuration died with `STATUS_HEAP_CORRUPTION` (`0xC0000374`), a fast-fail with
+no stack. Page heap identified the cause: ntdll was calling a module entry point
+in memory that had already been released, dispatched from its thread
+initialization path, because memory modules never set `DontCallForThreads` and so
+received `DLL_THREAD_ATTACH` on threads we do not control. `00ed378` sets that
+flag. The heap corruption has not recurred since.
+
+**What replaced it is a deadlock**, and whether that is progress is genuinely
+unresolved. Two readings fit the evidence equally well: either the corruption was
+killing the process before a pre-existing deadlock could form, and fixing it
+merely exposed the next bug; or the flag itself introduced the hang. Against the
+first reading, 16+8 also went from 3/3 clean to 2/3, which is a small sample but
+the wrong direction. **Do not treat `00ed378` as validated.** Deciding between
+those two readings is the next task, and reverting it to re-measure is a
+legitimate way to start.
+
+At the hang, 18 threads sit in `LdrpCallInitializers` running a payload
+`DllMain` (process attach) and 6 in `LdrUnloadDllMemory` running one (process
+detach). Both run outside the loader lock by design. The payload frames are
+misattributed by cdb to its only export; they are really its static CRT.
+
+**Conditions required to reproduce the 24-thread failure.** Both together:
 
 - **Many loader threads each mapping a *distinct* image.** 24 threads in
-  `--mode distinct` reproduces; 16 threads does not.
+  `--mode distinct` reproduces; 16 threads mostly does not.
 - **Concurrent ordinary `LoadLibrary`/`FreeLibrary` traffic.** With `--noise 0`
   the same 24 threads are clean.
 
@@ -53,10 +75,17 @@ same heap. Those internals have invariants we may not be honouring, and the
 noise DLLs reach the same structures through ntdll's supported path. That is the
 next thing to narrow.
 
-**Not yet tried:** page heap (`gflags -p /enable stress.exe`) to turn the
-corrupting write into an immediate, precisely located fault. It needs elevation
-and it perturbs timing, which matters here: the bug does not reproduce under
-`cdb` at all.
+**Page heap.** `gflags /p /enable stress.exe /full` is what found the cause of the
+heap corruption, so it is worth reaching for again. Two things to know: it needs
+elevation, and it perturbs timing so heavily that it becomes useless above a
+handful of threads. Under it, 4 loader threads finished in 742ms while 8 ran past
+four minutes, so a hang measured under page heap means nothing. Use it to locate
+a specific corrupting write at low thread counts, then turn it off with
+`gflags /p /disable stress.exe` before measuring anything.
+
+Elevation note: an elevated process cannot see a per-user mapped network drive,
+so launching one with its working directory on `Z:` fails. Pass an explicit local
+working directory (`-WorkingDirectory "C:\Windows\Temp"`).
 
 ## What this bench already found and fixed
 
