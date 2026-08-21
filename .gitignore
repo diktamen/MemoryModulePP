@@ -347,3 +347,5 @@ healthchecksdb
 # Loader stress harness build output
 stress/bin/
 stress/bin-prepatch/
+
+stress/bin-basehash/

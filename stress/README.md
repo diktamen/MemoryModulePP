@@ -12,27 +12,43 @@ instead of by reading.
 
 ## What is currently broken
 
-**Where it stands.** Clean at 24 loader threads plus 12 noise threads over 100
-iterations, 6/6. At 200 iterations, 3/4, with one `__fastfail`. That fast-fail is
-the only open bug.
+**Where it stands.** One open bug, and it is not ours. Measured at 8 loader
+threads plus 8 noise over 200 iterations, 8 runs each: 7/8 clean now, against
+5/8 before the `LdrpHashTable` change below. Roughly a 12% failure rate, down
+from about a third. Not clean.
 
-**Symptom.** Exit `0xC0000409` (`STATUS_STACK_BUFFER_OVERRUN`), which here is
-`__fastfail`, not a stack overrun. MemoryModulePP calls it from several
-invariant checks and it bypasses SEH entirely, so no handler and no crash
-reporter output; only the exit code shows it. Candidate sites, all bar one in
-the unload path:
+**Symptom.** Exit `0xC0000409`. Caught under `cdb`, the subcode and stack are
+unambiguous:
 
-- `LdrUnloadDllMemory`, `SizeOfImage` disagreeing with the loader entry
-- `MmpUnregisterExceptionTable` failing (`FAST_FAIL_CORRUPT_LIST_ENTRY`)
-- `MmpReleaseTlsEntry` failing
-- `RtlFreeLdrDataTableEntry` failing
-- `MemoryFreeLibrary` failing
-- `LdrLoadDllMemoryExW`, `MapMemoryModuleHandle` returning null after a
-  successful map
+```
+Subcode: 0x3 FAST_FAIL_CORRUPT_LIST_ENTRY
+ntdll!LdrpInsertDataTableEntry+0x12c
+ntdll!LdrpMapDllWithSectionHandle
+ntdll!LdrpLoadKnownDll
+ntdll!LdrpFindOrPrepareLoadingModule
+ntdll!LdrpLoadDependentModuleInternal
+...
+KERNELBASE!LoadLibraryExW
+stress!NoiseThread
+```
 
-It does not reproduce under `cdb`. Narrowing it needs either a post-mortem dump
-or replacing the blind `__fastfail` calls with something that records which
-check fired.
+This is **ntdll fast-failing on its own list validation**, on a noise thread
+doing an ordinary `LoadLibraryExW`, while inserting an unrelated module. Not one
+of MemoryModulePP's own `__fastfail` calls. It means a list in ntdll's loader
+database is inconsistent, and since the only foreign entries in those lists are
+the ones we fabricate, we are still corrupting something.
+
+Partly localised: not inserting into `LdrpHashTable` cuts the rate roughly in
+half, so that insert is one source but not the only one. What remains is most
+likely elsewhere in the fabricated `LDR_DATA_TABLE_ENTRY` -- the `DdagNode` and
+its `Modules`/dependency lists are the obvious suspects, since
+`RtlFreeLdrDataTableEntry` dismantles them and can re-enter ntdll through
+`LdrUnloadDll` while our entry is still linked.
+
+Worth noting for anyone reading the stacks: this machine is ARM64 running the
+x64 harness under emulation, so stacks carry `ARM64EC` frames and
+`CpuSetInSyscallCallback`-style artifacts. Nothing here has been confirmed on
+native x64.
 
 ### Correction: there was never a deadlock here
 
@@ -59,7 +75,22 @@ configuration can finish at all.
 | Hypothesis | Test | Result |
 | --- | --- | --- |
 | Loader TLS handling | payload built without `thread_local`, so no TLS directory | identical, not this |
-| Loader lock held across import resolution | released around `MemoryResolveImportTable` | identical, not this |
+| Loader lock held across import resolution | released around `MemoryResolveImportTable` | identical, not this; the release was reverted |
+| Hash bucket index out of range | index is masked to the table size, and `MmInitialize` validates that every existing entry hashes to its own bucket | sound, not this |
+
+### On sampling, because it has misled this investigation twice
+
+These failures are probabilistic, and small samples have produced two confident
+conclusions here that were both wrong. A 60 second timeout turned slow runs into
+a phantom deadlock and an entire document section arguing about it. A 6/6 and a
+4/4 made the `LdrpHashTable` change look like a complete fix; at 8 runs a side it
+is 7/8 against 5/8, which is a real improvement and nothing like a cure.
+
+Treat anything below about 8 runs a side as a hint, not a result, and when a
+change looks like a total fix, re-measure before writing it down. Where a
+comparison matters, build the previous commit into `stress\bin-basehash` with an
+`OutDir` override and run both with the same rep count, rather than comparing
+against numbers from an earlier session.
 
 One control result is worth keeping permanently, because it is what makes every
 other verdict here trustworthy: `--threads 0 --noise 8` did 2943 ordinary
