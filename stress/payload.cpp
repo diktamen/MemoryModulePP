@@ -62,6 +62,17 @@ extern "C" __declspec(dllexport) int StressPing(int value) {
     return -1;
 }
 
+//
+// Same as StressPing but without the SEH frame, for runs that deliberately load
+// with LOAD_FLAGS_NOT_ADD_INVERTED_FUNCTION. Without an inverted function table
+// entry, x64 exception dispatch cannot find this module's exception directory,
+// so raising there would be an unhandled fault rather than a test result.
+//
+extern "C" __declspec(dllexport) int StressPingNoSeh(int value) {
+    t_tlsSlot = value;
+    return t_tlsSlot + 1;
+}
+
 extern "C" __declspec(dllexport) int StressAttachCount() {
     return g_attachCount;
 }

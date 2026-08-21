@@ -42,8 +42,16 @@
 // From MemoryModule/Loader.h. Duplicated rather than included so the harness
 // builds against a shipped DLL without needing the source tree's headers.
 //
-#define LOAD_FLAGS_USE_DLL_NAME             0x00040000
-#define LOAD_FLAGS_NOT_FAIL_IF_HANDLE_TLS   0x20000000
+#define LOAD_FLAGS_USE_DLL_NAME               0x00040000
+#define LOAD_FLAGS_NOT_FAIL_IF_HANDLE_TLS     0x20000000
+#define LOAD_FLAGS_NOT_ADD_INVERTED_FUNCTION  0x00010000
+
+//
+// Set by --no-ift. Loading with LOAD_FLAGS_NOT_ADD_INVERTED_FUNCTION skips all
+// LdrpInvertedFunctionTable manipulation, which isolates whether a failure comes
+// from that table or from the rest of the load path.
+//
+static bool g_skipInvertedTable = false;
 
 typedef HMODULE(WINAPI* PFN_LoadLibraryMemoryExW)(PVOID, size_t, LPCWSTR, LPCWSTR, DWORD);
 typedef BOOL(WINAPI* PFN_FreeLibraryMemory)(HMODULE);
@@ -214,7 +222,10 @@ static void LoaderThread(int index, PVOID image, bool distinctNames, int iterati
         : std::wstring(L"stress_shared.dll");
     std::wstring fullName = L"C:\\MemoryModules\\" + baseName;
 
-    const DWORD flags = LOAD_FLAGS_USE_DLL_NAME | LOAD_FLAGS_NOT_FAIL_IF_HANDLE_TLS;
+    DWORD flags = LOAD_FLAGS_USE_DLL_NAME | LOAD_FLAGS_NOT_FAIL_IF_HANDLE_TLS;
+    if (g_skipInvertedTable) flags |= LOAD_FLAGS_NOT_ADD_INVERTED_FUNCTION;
+
+    const char* pingExport = g_skipInvertedTable ? "StressPingNoSeh" : "StressPing";
 
     for (int i = 0; i < iterations && !g_stop.load(); ++i) {
         if (coin(rng) == 0) Sleep(longSleep(rng)); else Sleep(shortSleep(rng));
@@ -232,7 +243,7 @@ static void LoaderThread(int index, PVOID image, bool distinctNames, int iterati
         //
         if (coin(rng) < 3) SwitchToThread(); else Sleep(shortSleep(rng));
 
-        PFN_StressPing ping = (PFN_StressPing)GetProcAddress(mod, "StressPing");
+        PFN_StressPing ping = (PFN_StressPing)GetProcAddress(mod, pingExport);
         if (!ping) {
             g_pingFailures.fetch_add(1);
         }
@@ -335,9 +346,10 @@ static void Usage() {
         "  --dll <path>       MemoryModule DLL to test   (default MemoryModule64.dll)\n"
         "  --payload <path>   image to load from memory  (default stresspayload.dll)\n"
         "  --mode <m>         same | distinct | mixed    (default mixed)\n"
-        "  --threads <n>      loader threads             (default 8)\n"
+        "  --threads <n>      loader threads             (default 8, 0 = noise-only control)\n"
         "  --noise <n>        LoadLibrary noise threads  (default 4)\n"
         "  --iters <n>        load/unload per thread     (default 200)\n"
+        "  --seconds <n>      duration when --threads 0  (default 5)\n"
     );
 }
 
@@ -345,7 +357,7 @@ int main(int argc, char** argv) {
     const char* dllPath = "MemoryModule64.dll";
     const char* payloadPath = "stresspayload.dll";
     std::string mode = "mixed";
-    int threads = 8, noise = 4, iters = 200;
+    int threads = 8, noise = 4, iters = 200, noiseSeconds = 5;
 
     for (int i = 1; i < argc; ++i) {
         auto next = [&](const char* what) -> const char* {
@@ -358,13 +370,24 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--threads")) threads = atoi(next("--threads"));
         else if (!strcmp(argv[i], "--noise")) noise = atoi(next("--noise"));
         else if (!strcmp(argv[i], "--iters")) iters = atoi(next("--iters"));
+        else if (!strcmp(argv[i], "--seconds")) noiseSeconds = atoi(next("--seconds"));
+        else if (!strcmp(argv[i], "--no-ift")) g_skipInvertedTable = true;
         else { Usage(); return 2; }
     }
 
     if (mode != "same" && mode != "distinct" && mode != "mixed") { Usage(); return 2; }
-    if (threads < 1) threads = 1;
+    if (threads < 0) threads = 0;
     if (iters < 1) iters = 1;
-    if (mode != "mixed") noise = (mode == "mixed") ? noise : noise;
+
+    //
+    // threads == 0 is the control case: noise only, no memory modules at all.
+    // If that ever fails, the harness or the machine is at fault rather than
+    // MemoryModulePP, because it is nothing but ordinary LoadLibrary traffic.
+    //
+    if (threads == 0 && noise == 0) {
+        fprintf(stderr, "nothing to do: both --threads and --noise are 0\n");
+        return 2;
+    }
 
     //
     // Under a debugger, leave the exception alone so it reaches second chance
@@ -447,6 +470,15 @@ int main(int argc, char** argv) {
             Sleep(50);
         }
         });
+
+    if (workers.empty()) {
+        //
+        // Noise-only control run: there is no iteration count to bound it, so
+        // give the noise threads a fixed window.
+        //
+        printf("noise-only control run: %d seconds\n", noiseSeconds);
+        for (int i = 0; i < noiseSeconds * 10 && !g_stop.load(); ++i) Sleep(100);
+    }
 
     for (auto& t : workers) t.join();
     g_stop.store(true);
