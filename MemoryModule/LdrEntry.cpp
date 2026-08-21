@@ -146,12 +146,26 @@ BOOL NTAPI RtlInitializeLdrDataTableEntry(
 		// search as well as the insert, which is why it is taken out here rather
 		// than inside RtlInsertModuleBaseAddressIndexNode.
 		//
+		BOOLEAN indexed = FALSE;
 		{
 			MmpDatatableLockGuard databaseLock;
-			if (!NT_SUCCESS(RtlInsertModuleBaseAddressIndexNode(LdrEntry, BaseAddress)))return FALSE;
+			if (!NT_SUCCESS(RtlInsertModuleBaseAddressIndexNode(LdrEntry, BaseAddress, &indexed)))return FALSE;
 		}
+
 		if (!(entry->DdagNode = (decltype(entry->DdagNode))
-			RtlAllocateHeap(heap, HEAP_ZERO_MEMORY, IsWin8 ? sizeof(_LDR_DDAG_NODE_WIN8) : sizeof(_LDR_DDAG_NODE))))return FALSE;
+			RtlAllocateHeap(heap, HEAP_ZERO_MEMORY, IsWin8 ? sizeof(_LDR_DDAG_NODE_WIN8) : sizeof(_LDR_DDAG_NODE)))) {
+			//
+			// The node is already in ntdll's tree and the caller is about to free
+			// this entry. Take it back out first; otherwise ntdll's index is left
+			// pointing into a freed heap block, and nothing later knows to remove
+			// it because InIndexes below never got set.
+			//
+			if (indexed) {
+				MmpDatatableLockGuard databaseLock;
+				RtlRemoveModuleBaseAddressIndexNode(LdrEntry);
+			}
+			return FALSE;
+		}
 
 		entry->NodeModuleLink.Flink = &entry->DdagNode->Modules;
 		entry->NodeModuleLink.Blink = &entry->DdagNode->Modules;
@@ -161,7 +175,13 @@ BOOL NTAPI RtlInitializeLdrDataTableEntry(
 		entry->DdagNode->LoadCount = 1;
 		if (IsWin8) ((_LDR_DDAG_NODE_WIN8*)(entry->DdagNode))->ReferenceCount = 1;
 		entry->ImageDll = entry->LoadNotificationsSent = entry->EntryProcessed =
-			entry->InLegacyLists = entry->InIndexes = true;
+			entry->InLegacyLists = true;
+		//
+		// Only what actually went into the tree, never an unconditional true:
+		// this bit is what teardown reads to decide whether to hand ntdll a node
+		// to remove.
+		//
+		entry->InIndexes = indexed;
 		entry->ProcessAttachCalled = false;
 
 		//
@@ -273,7 +293,13 @@ BOOL NTAPI RtlFreeLdrDataTableEntry(_In_ PLDR_DATA_TABLE_ENTRY LdrEntry) {
 			InitializeListHead(&LdrEntry->InMemoryOrderLinks);
 			InitializeListHead(&LdrEntry->InInitializationOrderLinks);
 
-			RtlRemoveModuleBaseAddressIndexNode(LdrEntry);
+			//
+			// Only if the node is actually in the tree. Removing one that never
+			// went in means handing ntdll's RtlRbRemoveNode an all-zero node,
+			// whose null ParentValue reads as "I am the root" -- which unlinks
+			// the real root and corrupts the index.
+			//
+			if (entry->InIndexes) RtlRemoveModuleBaseAddressIndexNode(LdrEntry);
 		}
 
 		RtlFreeDependencies(entry);

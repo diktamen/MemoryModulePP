@@ -243,17 +243,36 @@ by the caller, and loads then fail unless the caller passes
 
 Three distinct problems in `BaseAddressIndex.cpp` and its caller:
 
-1. **Equal-base branch lies about success.** When an entry with the same
-   `DllBase` already exists, the function bumps that entry's `LoadCount` and
-   returns `STATUS_SUCCESS` *without inserting*. The caller then sets
-   `InIndexes = true`, and unload calls `RtlRemoveModuleBaseAddressIndexNode`
+1. **Equal-base branch lied about success — FIXED.** When an entry with the same
+   `DllBase` already existed, the function bumped that entry's `LoadCount` and
+   returned `STATUS_SUCCESS` *without inserting*. The caller then set
+   `InIndexes = true`, and unload called `RtlRemoveModuleBaseAddressIndexNode`
    unconditionally — handing ntdll's `RtlRbRemoveNode` an all-zero node whose
-   null `ParentValue` reads as "I am the root". That corrupts the tree.
-   Reachable via `ReflectiveMapDll`, which passes an already-loaded `hModule`.
-2. **Inserted but not removed on partial failure.** If the node goes in and the
-   `DdagNode` allocation then fails, `RtlInitializeLdrDataTableEntry` returns
-   FALSE and the caller frees the entry without removing the node. ntdll's tree
-   is left pointing into a freed heap block. Needs an allocation failure.
+   null `ParentValue` reads as "I am the root", corrupting the tree.
+
+   It now returns `STATUS_OBJECT_NAME_COLLISION` and inserts nothing, so the
+   load fails cleanly. For a memory module the collision cannot legitimately
+   happen — `MemoryLoadLibrary` just reserved that range, so it is exclusively
+   ours, and a genuine reflective load arrives with a base ntdll has never seen.
+   Reaching it means the tree holds a stale node for a recycled address, or the
+   caller passed a base ntdll already owns (calling the exported
+   `ReflectiveMapDll` on an already-loaded module does exactly that). Publishing
+   further into a structure already known to be inconsistent is how the original
+   corruption happened, so it fails instead.
+
+   The `LoadCount` bump is gone too: it incremented a *different* module's count
+   and nothing in our teardown ever gave it back, leaking a reference on an
+   unrelated entry.
+
+   `RtlInsertModuleBaseAddressIndexNode` now reports insertion through an
+   `_Out_opt_ PBOOLEAN Inserted`, that is the only thing that sets `InIndexes`,
+   and teardown removes the node only when `InIndexes` is set.
+2. **Inserted but not removed on partial failure — FIXED.** If the node went in
+   and the `DdagNode` allocation then failed, `RtlInitializeLdrDataTableEntry`
+   returned FALSE and the caller freed the entry without removing the node,
+   leaving ntdll's tree pointing into a freed heap block. That path now removes
+   the node before returning. Needs an allocation failure to reach, so it is
+   correct by inspection rather than by test.
 3. **Published before valid.** The node enters the tree before `DllBase`,
    `SizeOfImage`, `BaseDllName` and `DdagNode` are filled in. The datatable lock
    now covers this window, so ntdll cannot observe it — but the ordering is still

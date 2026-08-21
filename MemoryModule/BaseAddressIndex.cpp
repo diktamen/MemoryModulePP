@@ -31,7 +31,10 @@ VOID NTAPI RtlRbRemoveNode(
 //
 NTSTATUS NTAPI RtlInsertModuleBaseAddressIndexNode(
 	_In_ PLDR_DATA_TABLE_ENTRY DataTableEntry,
-	_In_ PVOID BaseAddress) {
+	_In_ PVOID BaseAddress,
+	_Out_opt_ PBOOLEAN Inserted) {
+	if (Inserted)*Inserted = FALSE;
+
 	auto LdrpModuleBaseAddressIndex = MmpGlobalDataPtr->MmpBaseAddressIndex->LdrpModuleBaseAddressIndex;
 	if (!LdrpModuleBaseAddressIndex)return STATUS_UNSUCCESSFUL;
 
@@ -51,15 +54,33 @@ NTSTATUS NTAPI RtlInsertModuleBaseAddressIndexNode(
 			LdrNode = CONTAINING_RECORD(LdrNode->BaseAddressIndexNode.Right, LDR_DATA_TABLE_ENTRY_WIN8, BaseAddressIndexNode);
 		}
 		else {
-			LdrNode->DdagNode->LoadCount++;
-			if (RtlIsWindowsVersionOrGreater(10, 0, 0)) {
-				PLDR_DATA_TABLE_ENTRY_WIN10(LdrNode)->ReferenceCount++;
-			}
-			return STATUS_SUCCESS;
+			//
+			// A node already keyed on this base. For a memory module that cannot
+			// legitimately happen: MemoryLoadLibrary just reserved this range, so
+			// it is exclusively ours, and a genuine reflective load arrives with a
+			// base ntdll has never seen. Reaching here means either the tree still
+			// holds a stale node for an address that has since been recycled, or
+			// the caller passed a base ntdll already owns -- which is what calling
+			// the exported ReflectiveMapDll on an already-loaded module does.
+			//
+			// This used to bump the found entry's LoadCount and return success.
+			// Both halves were wrong. The count belongs to a different module and
+			// nothing in our teardown ever gives it back, so it leaked a reference
+			// on an unrelated entry; and reporting success while inserting nothing
+			// let the caller set InIndexes, after which unload handed ntdll's
+			// RtlRbRemoveNode an all-zero node whose null ParentValue reads as "I
+			// am the root" -- corrupting the whole index.
+			//
+			// Fail instead. The tree is telling us something we know to be
+			// impossible, and publishing further into a structure that is already
+			// inconsistent is precisely how the original corruption happened.
+			//
+			return STATUS_OBJECT_NAME_COLLISION;
 		}
 	}
 
 	RtlRbInsertNodeEx(LdrpModuleBaseAddressIndex, &LdrNode->BaseAddressIndexNode, bRight, &PLDR_DATA_TABLE_ENTRY_WIN8(DataTableEntry)->BaseAddressIndexNode);
+	if (Inserted)*Inserted = TRUE;
 	return STATUS_SUCCESS;
 }
 
