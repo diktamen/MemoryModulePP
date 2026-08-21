@@ -137,9 +137,20 @@ Two things to know about the new behaviour:
   load.** Anything reading them straight after `LoadLibrary` sees an
   uninitialized library. Call `MmInitialize` explicitly if eager setup is wanted;
   the guard stands aside when it finds the library already initialized.
-- **The check costs up to ~400 ms on the first load**, which is the window it
-  waits to be sure a non-blocked `LoadLibrary` would have finished. One-time, and
+- **The check costs ~420–500 ms on the first load**, which is the window it waits
+  to be sure a non-blocked `LoadLibrary` would have finished. One-time, and
   tunable if that turns out to matter.
+
+**Moving that cost off the load path:** call the exported `MmInitialize` from a
+thread of your own before any memory module is loaded. It runs the causality
+check too, so once it returns everything is located and verified and the first
+real load pays nothing. `stress --prewarm` is exactly that pattern and asserts
+it: measured 419 ms on arm64, 504 ms on x64-under-ARM64X, 425–431 ms on genuine
+x64, all off the load path. The first-use guard tests for "already initialized"
+under the loader lock rather than by reading `MmpGlobalDataPtr`, because that
+pointer is published by the section mapping before the fields behind it are
+written — an unlocked test could see a half-built structure while the prewarm
+thread was still inside it.
 
 **Residual gap:** the check skips itself when the calling thread already owns the
 loader lock — a consumer calling in from their own `DllMain`, and the reflective

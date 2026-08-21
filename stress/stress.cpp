@@ -386,6 +386,7 @@ static void Usage() {
         "  --noise <n>        LoadLibrary noise threads  (default 4)\n"
         "  --iters <n>        load/unload per thread     (default 200)\n"
         "  --seconds <n>      duration when --threads 0  (default 5)\n"
+        "  --prewarm          MmInitialize on its own thread before any load\n"
     );
 }
 
@@ -394,6 +395,7 @@ int main(int argc, char** argv) {
     const char* payloadPath = "stresspayload.dll";
     std::string mode = "mixed";
     int threads = 8, noise = 4, iters = 200, noiseSeconds = 5;
+    bool prewarm = false;
 
     for (int i = 1; i < argc; ++i) {
         auto next = [&](const char* what) -> const char* {
@@ -407,6 +409,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--noise")) noise = atoi(next("--noise"));
         else if (!strcmp(argv[i], "--iters")) iters = atoi(next("--iters"));
         else if (!strcmp(argv[i], "--seconds")) noiseSeconds = atoi(next("--seconds"));
+        else if (!strcmp(argv[i], "--prewarm")) prewarm = true;
         else if (!strcmp(argv[i], "--no-ift")) g_skipInvertedTable = true;
         else if (!strcmp(argv[i], "--force-seh")) g_forceSeh = true;
         else { Usage(); return 2; }
@@ -469,7 +472,45 @@ int main(int argc, char** argv) {
     // here while silently losing the causality verification.
     //
     auto locatedFlag = (volatile LONG*)GetProcAddress(mm, "MmpModuleDatatableLockLocated");
+    auto verifiedFlag = (volatile LONG*)GetProcAddress(mm, "MmpModuleDatatableLockVerified");
     bool eagerInDllMain = locatedFlag && *locatedFlag;
+
+    //
+    // --prewarm models a consumer that pushes initialization onto a thread of
+    // its own so nothing is left to pay for on the first real load. What has to
+    // hold for that to be worth doing is that the causality check -- the only
+    // expensive part, up to ~400ms -- runs on that thread and not later. So
+    // measure it there and require it to be complete before any load happens.
+    //
+    long long prewarmMs = -1;
+    if (prewarm) {
+        auto init = (NTSTATUS(NTAPI*)())GetProcAddress(mm, "MmInitialize");
+        if (!init) {
+            fprintf(stderr, "%s does not export MmInitialize\n", dllPath);
+            return 1;
+        }
+
+        auto start = std::chrono::steady_clock::now();
+        NTSTATUS st = 0;
+        std::thread t([&] { st = init(); });
+        t.join();
+        prewarmMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start).count();
+
+        if (st < 0) {
+            fprintf(stderr, "prewarm MmInitialize failed (0x%08lX)\n", (unsigned long)st);
+            return 1;
+        }
+        if (!locatedFlag || !*locatedFlag) {
+            fprintf(stderr, "prewarm did not locate the datatable lock\n");
+            return 1;
+        }
+        if (!verifiedFlag || !*verifiedFlag) {
+            fprintf(stderr, "prewarm left causality unverified -- the cost would "
+                            "still land on the first load\n");
+            return 1;
+        }
+    }
 
     //
     // One throwaway load to trigger first-use initialization. This is the path a
@@ -621,12 +662,15 @@ int main(int argc, char** argv) {
             // possible at all, so report both facts together: they stand or
             // fall as one change.
             //
-            auto verified = (volatile LONG*)GetProcAddress(mm, "MmpModuleDatatableLockVerified");
             printf("  datatable init    : %s, causality %s\n",
-                eagerInDllMain ? "EAGER IN DllMain (regressed)" : "deferred to first use",
-                !verified ? "(not exported)"
-                : *verified ? "VERIFIED"
+                eagerInDllMain ? "EAGER IN DllMain (regressed)"
+                : prewarmMs >= 0 ? "prewarmed on its own thread"
+                : "deferred to first use",
+                !verifiedFlag ? "(not exported)"
+                : *verifiedFlag ? "VERIFIED"
                 : "not verified (structural checks only)");
+            if (prewarmMs >= 0)
+                printf("  prewarm cost      : %lld ms, off the load path\n", prewarmMs);
             if (acquires) printf("  datatable acquires: %ld\n", *acquires);
             if (skipped && *skipped) printf("  datatable skipped : %ld\n", *skipped);
         }

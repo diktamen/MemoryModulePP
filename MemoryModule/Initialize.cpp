@@ -525,6 +525,16 @@ NTSTATUS NTAPI MmInitialize() {
 		LdrUnlockLoaderLock(LDR_UNLOCK_LOADER_LOCK_FLAG_RAISE_ON_ERRORS, cookie);
 	}
 
+	//
+	// With the loader lock down, the causality check can run. Doing it here and
+	// not only in MmpEnsureInitialized is what makes prewarming work: a caller
+	// that spawns a thread to call MmInitialize before any memory module is
+	// loaded pays this cost there instead of on whichever thread happens to
+	// perform the first load. Idempotent, and it skips itself when this is being
+	// called from a DllMain.
+	//
+	if (NT_SUCCESS(status)) MmpVerifyModuleDatatableLock();
+
     return status;
 }
 
@@ -570,7 +580,28 @@ NTSTATUS NTAPI MmpEnsureInitialized() {
 	if (InterlockedCompareExchange(&MmpInitializeState, 1, 0) == 0) {
 		InterlockedExchange(&MmpInitializeOwner, self);
 
-		MmpInitializeStatus = MmpGlobalDataPtr ? STATUS_SUCCESS : MmInitialize();
+		//
+		// Test for "somebody already initialized us" under the loader lock,
+		// which is the lock MmInitialize holds while it fills the global data
+		// in. MmpGlobalDataPtr is published by the section mapping *before* the
+		// fields behind it are written, so an unlocked test can see a
+		// half-built structure while another thread is still inside
+		// InitializeLockHeld -- which is exactly what a caller prewarming on its
+		// own thread produces. Taking the lock makes us wait for that to finish.
+		//
+		PVOID cookie;
+		LdrLockLoaderLock(LDR_LOCK_LOADER_LOCK_FLAG_RAISE_ON_ERRORS, nullptr, &cookie);
+		BOOLEAN already = MmpGlobalDataPtr != nullptr;
+		LdrUnlockLoaderLock(LDR_UNLOCK_LOADER_LOCK_FLAG_RAISE_ON_ERRORS, cookie);
+
+		MmpInitializeStatus = already ? STATUS_SUCCESS : MmInitialize();
+
+		//
+		// Retried here even when initialization was somebody else's: if they
+		// called MmInitialize from a DllMain the check will have skipped itself,
+		// and this call runs on an ordinary thread where it can succeed. A no-op
+		// once verification has passed.
+		//
 		if (NT_SUCCESS(MmpInitializeStatus)) MmpVerifyModuleDatatableLock();
 
 		InterlockedExchange(&MmpInitializeState, 2);

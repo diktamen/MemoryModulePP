@@ -570,6 +570,8 @@ static BOOLEAN MmpLoaderLockHeldByCurrentThread() {
 	return lock && lock->OwningThread == NtCurrentTeb()->ClientId.UniqueThread;
 }
 
+static volatile LONG MmpVerifyClaimed = 0;
+
 VOID NTAPI MmpVerifyModuleDatatableLock() {
 	if (!MmpModuleDatatableLock || MmpModuleDatatableLockVerified) return;
 
@@ -579,7 +581,19 @@ VOID NTAPI MmpVerifyModuleDatatableLock() {
 	// expire and a perfectly good address would read as a failure. Skip, and
 	// leave the lock resting on donor agreement plus the structural checks.
 	//
+	// Tested before the claim below, so that a skipped attempt leaves the way
+	// open for a later call from an ordinary thread to try again.
+	//
 	if (MmpLoaderLockHeldByCurrentThread()) return;
+
+	//
+	// One attempt per process. A caller that prewarms on its own thread and a
+	// first load arriving at the same time both reach here, and two threads each
+	// taking the lock exclusively to time the other's loads would measure
+	// nothing useful. The loser returns and carries on; verification is
+	// advisory, and the lock is already usable.
+	//
+	if (InterlockedCompareExchange(&MmpVerifyClaimed, 1, 0) != 0) return;
 
 	MmpLockProbe.Ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 	MmpLockProbe.Go = CreateEventW(nullptr, TRUE, FALSE, nullptr);
