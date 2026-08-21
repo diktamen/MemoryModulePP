@@ -139,6 +139,21 @@ if errorlevel 1 (
     exit /b 1
 )
 
+echo === building nativetls control ===
+rem
+rem Control for the TLS wrong-answer defect: loads the same payload with the
+rem ordinary Windows loader and never touches MemoryModulePP, so a failure there
+rem means the bug is not ours. See OPEN-ISSUES.md issue 4.
+rem
+cl /nologo /std:c++17 /O2 /MT /EHsc ^
+    /Fo"%OUT%\nativetls.obj" /Fd"%OUT%\nativetls.pdb" ^
+    "%~dp0nativetls.cpp" ^
+    /link /OUT:"%OUT%\nativetls.exe"
+if errorlevel 1 (
+    echo error: nativetls build failed.
+    exit /b 1
+)
+
 rem
 rem Diagnostic variants. These are byte-identical copies of stress.exe; the only
 rem thing that differs is the file name, which is what gflags keys its Image File

@@ -179,6 +179,26 @@ failures. It survives the lock fix untouched and is the only reason a run still
 reports `FAIL` on a healthy build. **When triaging, separate exit `1` with a lone
 ping failure from exit `0xC0000409`; they are different bugs.**
 
+**It is ours, and that is now measured rather than assumed.** `stress/nativetls.cpp`
+is the control: it loads the *same* payload with plain `LoadLibraryW`, never
+touches MemoryModulePP — it refuses to run if a MemoryModule DLL is in the
+process — and hammers the same two exports. Three phases, because a dynamically
+loaded DLL with implicit TLS has more than one interesting case: `steady` (load,
+then create threads), `retrofit` (create threads, *then* load, so the loader has
+to fit TLS to threads that already exist — the job `MmpHandleTlsData`
+reimplements), and `churn` (ping while other threads load and free the same
+module).
+
+| Configuration | pings | wrong | expected if it were an OS/CRT bug |
+| --- | --- | --- | --- |
+| native ARM64 | 1,920,000 | **0** | ~1,200 |
+| x64 under ARM64X | 576,000 | **0** | ~45 |
+| genuine x64 (Server 2022) | 1,080,000 | **0** | ~84 |
+
+So the ordinary loader does not reproduce it at ~3.5M pings, including the
+retrofit phase. Windows, the CRT, the payload and the test are all cleared;
+`MmpLdrpTls.cpp` is the right place to look.
+
 Suspects, in order: `MmpLdrpTls.cpp` locating ntdll's `LdrpHandleTlsData` by a
 multi-stage code-and-data pattern scan (see issue 6); the ordering between
 `MmpHandleTlsData` and the module's TLS callbacks; and per-thread TLS vector
