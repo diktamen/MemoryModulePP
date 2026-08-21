@@ -5,6 +5,15 @@ extern "C" volatile LONG MmpModuleDatatableLockAcquires = 0;
 extern "C" volatile LONG MmpModuleDatatableLockSkipped = 0;
 extern "C" volatile LONG MmpModuleDatatableLockRva = 0;
 
+//
+// How many donors agreed on the address that won. The margin above
+// MMP_LOCK_MIN_AGREEMENT is the only warning available when a future Windows
+// build starts inlining the acquire in one donor after another: the capability
+// does not fail loudly, it just stops locating the lock. Reading this in the
+// stress harness turns "still works" into "still works, with N to spare".
+//
+extern "C" volatile LONG MmpModuleDatatableLockAgreement = 0;
+
 typedef VOID(NTAPI* PFN_SRWLOCK_OP)(PVOID);
 
 static PVOID           MmpModuleDatatableLock = nullptr;
@@ -12,33 +21,49 @@ static PFN_SRWLOCK_OP  MmpAcquireSRWLockExclusive = nullptr;
 static PFN_SRWLOCK_OP  MmpReleaseSRWLockExclusive = nullptr;
 
 //
-// Exported ntdll functions that load the lock into the first-argument register
-// and then call an exported SRW acquire.
+// Exported ntdll functions from which the lock address can be decoded, either
+// because they take it themselves or because they call a helper that does.
 //
-// This has to be the union across architectures and Windows versions, because
-// which of them are decodable varies and the overlap is thin. Measured:
+// This list is not guessed. lockprobe --survey decodes every named ntdll export
+// on a machine and groups them by the address each yields; the group containing
+// the causality-verified lock is the set of usable anchors on that build. Run
+// across three configurations, that gives:
 //
-//                                    ARM64 10.0.26100   x64 6.3-era (2014)
-//   LdrQueryModuleServiceTags         yes                yes
-//   LdrDisableThreadCalloutsForDll    yes                no (inlined)
-//   LdrGetDllHandleByMapping          yes                no (inlined)
-//   LdrAddRefDll                      no (inlined)       yes
-//   LdrGetDllFullName                 no (inlined)       no (inlined)
+//                                    x64 2022   x64/ARM64X   ARM64
+//   LdrQueryModuleServiceTags         yes        yes          yes
+//   LdrGetDllHandleByMapping          yes        yes          yes
+//   LdrInitShimEngineDynamic          yes        yes          yes
+//   LdrGetDllHandleByName             yes        yes          -
+//   LdrGetDllHandleEx                 yes        yes          -
+//   LdrAddRefDll                      yes        -            yes
+//   LdrDisableThreadCalloutsForDll    yes        -            yes
+//   LdrGetDllFullName                 yes        -            -
+//   LdrFindEntryForAddress            yes        -            -
 //
-// Only LdrQueryModuleServiceTags decodes on both, so on each target exactly two
-// donors agree -- which is the minimum this file accepts. Do not trim this list
-// to the ones that work on whatever machine you happen to be testing: dropping
-// LdrAddRefDll silently disables the whole capability on x64, and dropping the
-// other two disables it on ARM64. If a future build inlines one more of these,
-// agreement falls below the minimum and the capability turns itself off, which
-// is the intended failure direction but shows up as the bug coming back.
+// Worst case is five agreeing rather than the two this used to scrape by on.
+// "-" means the export did not decode at all, which costs nothing; what matters
+// is that none of these decodes to the *wrong* address on any configuration.
+//
+// Deliberately excluded, though both are loader functions that survey does place
+// in the right group on some builds: LdrGetDllHandle and RtlQueueWorkItem each
+// decode to a *different* ntdll SRW lock under ARM64EC. The plurality vote below
+// exists to survive a stray answer like that, not to be fed them on purpose.
+//
+// Do not trim this list to whatever works on the machine in front of you --
+// three of these carry ARM64 and two carry ARM64EC. Trimming silently disables
+// the capability on an architecture you are not testing, and the failure is
+// quiet: the guards become no-ops and the list corruption comes back.
 //
 static const char* const MmpLockDonors[] = {
 	"LdrQueryModuleServiceTags",
-	"LdrDisableThreadCalloutsForDll",
 	"LdrGetDllHandleByMapping",
+	"LdrInitShimEngineDynamic",
+	"LdrGetDllHandleByName",
+	"LdrGetDllHandleEx",
 	"LdrAddRefDll",
+	"LdrDisableThreadCalloutsForDll",
 	"LdrGetDllFullName",
+	"LdrFindEntryForAddress",
 };
 
 #define MMP_LOCK_DONOR_COUNT (sizeof(MmpLockDonors) / sizeof(MmpLockDonors[0]))
@@ -90,6 +115,111 @@ static BOOLEAN MmpFollowEcThunk(_In_ const VOID* Function, _Out_ const VOID** Ta
 		((ULONG)b[12] << 16) | ((ULONG)b[13] << 24));
 	*Target = b + 14 + rel;
 	return TRUE;
+}
+
+//
+// ntdll's own function table, used to decide whether a computed call target is
+// real before recursing into it.
+//
+// The x64 decoder finds calls by scanning for an 0xE8 byte, and plenty of those
+// bytes are operands rather than opcodes. Following one lands mid-instruction in
+// unrelated code and the decode wanders. IMAGE_DIRECTORY_ENTRY_EXCEPTION already
+// lists the start RVA of every function with unwind data, so "is this a function
+// start" is a lookup rather than a guess, and the next entry's start says how far
+// a scan may run before it leaves the function it began in.
+//
+// Both x64 and ARM64 put BeginAddress first and the table is sorted, which is
+// what the OS unwinder relies on; only the entry stride differs. Searched in
+// place -- no allocation, because this runs from DllMain.
+//
+static const UCHAR* MmpNtdllBase = nullptr;
+static SIZE_T       MmpNtdllSize = 0;
+static const UCHAR* MmpPdata = nullptr;
+static SIZE_T       MmpPdataCount = 0;
+static SIZE_T       MmpPdataStride = 0;
+static ULONG        MmpPdataLow = 0;
+static ULONG        MmpPdataHigh = 0;
+
+static ULONG MmpPdataBegin(_In_ SIZE_T Index) {
+	return *(const ULONG*)(MmpPdata + Index * MmpPdataStride);
+}
+
+static VOID MmpInitFunctionTable(_In_ HMODULE Ntdll) {
+	MmpNtdllBase = (const UCHAR*)Ntdll;
+
+	PIMAGE_NT_HEADERS headers = RtlImageNtHeader(Ntdll);
+	if (!headers) return;
+	MmpNtdllSize = headers->OptionalHeader.SizeOfImage;
+
+	IMAGE_DATA_DIRECTORY* dir =
+		&headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+	if (!dir->VirtualAddress || !dir->Size) return;
+
+	MmpPdataStride = (headers->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64) ? 12 : 8;
+	MmpPdataCount = dir->Size / MmpPdataStride;
+	if (!MmpPdataCount) return;
+
+	MmpPdata = MmpNtdllBase + dir->VirtualAddress;
+	__try {
+		MmpPdataLow = MmpPdataBegin(0);
+		MmpPdataHigh = MmpPdataBegin(MmpPdataCount - 1);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		MmpPdata = nullptr;
+		MmpPdataCount = 0;
+	}
+}
+
+static BOOLEAN MmpIsFunctionStart(_In_ ULONG Rva) {
+	SIZE_T lo = 0, hi = MmpPdataCount;
+	while (lo < hi) {
+		SIZE_T mid = lo + (hi - lo) / 2;
+		ULONG begin = MmpPdataBegin(mid);
+		if (begin == Rva) return TRUE;
+		if (begin < Rva) lo = mid + 1; else hi = mid;
+	}
+	return FALSE;
+}
+
+//
+// How far a scan starting at Rva may run without crossing into the next
+// function. Falls back to Cap when the table cannot say.
+//
+static SIZE_T MmpFunctionExtent(_In_ ULONG Rva, _In_ SIZE_T Cap) {
+	if (!MmpPdataCount || Rva < MmpPdataLow || Rva > MmpPdataHigh) return Cap;
+
+	SIZE_T lo = 0, hi = MmpPdataCount;
+	while (lo < hi) {                            // first start strictly above Rva
+		SIZE_T mid = lo + (hi - lo) / 2;
+		if (MmpPdataBegin(mid) <= Rva) lo = mid + 1; else hi = mid;
+	}
+	if (lo >= MmpPdataCount) return Cap;
+
+	SIZE_T span = MmpPdataBegin(lo) - Rva;
+	return (span && span < Cap) ? span : Cap;
+}
+
+//
+// Whether a computed call target is worth recursing into. Certain when the
+// function table covers the address; a shape check otherwise, because ARM64X
+// keeps the x64/EC bodies outside the native .pdata this parses.
+//
+static BOOLEAN MmpIsFollowable(_In_ const VOID* Target) {
+	if (!MmpNtdllBase || !MmpNtdllSize) return FALSE;
+
+	ULONG_PTR t = (ULONG_PTR)Target;
+	ULONG_PTR base = (ULONG_PTR)MmpNtdllBase;
+	if (t < base || t + 16 >= base + MmpNtdllSize) return FALSE;
+
+	ULONG rva = (ULONG)(t - base);
+	if (MmpPdataCount) {
+		if (MmpIsFunctionStart(rva)) return TRUE;
+		if (rva >= MmpPdataLow && rva <= MmpPdataHigh) return FALSE;  // covered, not a start
+	}
+
+	if ((rva & 0xF) == 0) return TRUE;                 // aligned function start
+	const UCHAR* p = (const UCHAR*)Target;             // rva is not page-aligned,
+	return p[-1] == 0xCC || p[-1] == 0xC3;             // so p[-1] is on this page
 }
 
 //
@@ -191,22 +321,49 @@ static ULONG64 MmpReadLE64(_In_ const UCHAR* p) {
 // a false positive has to survive the range and alignment validation below, and
 // two donors have to independently agree on the same address.
 //
-static PVOID MmpDecodeX64(_In_ const VOID* Function, _In_ SIZE_T MaxBytes) {
+// Depth mirrors what the ARM64 decoder has always done, and is what makes this
+// work on x64 rather than limping. Only LdrQueryModuleServiceTags and
+// LdrAddRefDll take the lock in the exported function itself; the rest hand a
+// caller-supplied handle to an internal helper -- LdrpFindLoadedDllByHandle and
+// friends -- and the acquire happens down there. Without recursion those exports
+// simply do not decode, which is why a genuine x64 Server 2022 used to scrape by
+// on the bare minimum of two agreeing donors and now gets all of them.
+//
+// Unlike a BL on ARM64, an 0xE8 found by byte scanning may be an operand rather
+// than an opcode, so recursion only follows targets MmpIsFollowable accepts.
+//
+static PVOID MmpDecodeX64(
+	_In_ const VOID* Function,
+	_In_ SIZE_T MaxBytes,
+	_In_ ULONG Depth) {
+
 	const UCHAR* p = (const UCHAR*)Function;
+	ULONG followed = 0;
+
+	ULONG_PTR base = (ULONG_PTR)MmpNtdllBase;
+	if (MmpNtdllBase && (ULONG_PTR)p >= base && (ULONG_PTR)p < base + MmpNtdllSize)
+		MaxBytes = MmpFunctionExtent((ULONG)((ULONG_PTR)p - base), MaxBytes);
 
 	for (SIZE_T i = 0; i + 5 <= MaxBytes; ++i) {
-		if (p[i] != 0xE8) continue;                                  // call rel32
+		if (p[i] != 0xE8 && p[i] != 0xE9) continue;             // call / jmp rel32
 		const VOID* target = p + i + 5 + MmpReadLE32(p + i + 1);
-		if (!MmpIsAcquireTarget(target)) continue;
 
-		for (SIZE_T back = 3; back <= 64 && back <= i; ++back) {
-			const UCHAR* q = p + i - back;
-			if (q[0] == 0x48 && q[1] == 0x8D && q[2] == 0x0D) {      // lea rcx,[rip+d]
-				return (PVOID)(q + 7 + MmpReadLE32(q + 3));
+		if (MmpIsAcquireTarget(target)) {
+			for (SIZE_T back = 3; back <= 64 && back <= i; ++back) {
+				const UCHAR* q = p + i - back;
+				if (q[0] == 0x48 && q[1] == 0x8D && q[2] == 0x0D) {  // lea rcx,[rip+d]
+					return (PVOID)(q + 7 + MmpReadLE32(q + 3));
+				}
+				if (q[0] == 0x48 && q[1] == 0xB9) {                  // mov rcx, imm64
+					return (PVOID)MmpReadLE64(q + 2);
+				}
 			}
-			if (q[0] == 0x48 && q[1] == 0xB9) {                      // mov rcx, imm64
-				return (PVOID)MmpReadLE64(q + 2);
-			}
+			continue;      // acquire on a register we cannot source; keep looking
+		}
+
+		if (Depth > 0 && ++followed <= 8 && MmpIsFollowable(target)) {
+			PVOID r = MmpDecodeX64(target, 1024, Depth - 1);
+			if (r) return r;
 		}
 	}
 
@@ -229,12 +386,12 @@ static PVOID MmpDecodeDonor(_In_ const VOID* Function) {
 	if (MmpFollowEcThunk(Function, &ecBody)) {
 		PVOID r = MmpDecodeArm64(ecBody, 256, 2);
 		if (r) return r;
-		return MmpDecodeX64(ecBody, 512);
+		return MmpDecodeX64(ecBody, 512, 2);
 	}
 
-	PVOID r = MmpDecodeX64(Function, 512);
+	PVOID r = MmpDecodeX64(Function, 512, 2);
 	if (r) return r;
-	return MmpDecodeArm64(Function, 256, 0);
+	return MmpDecodeArm64(Function, 256, 2);
 }
 
 #else
@@ -297,6 +454,8 @@ NTSTATUS NTAPI MmpInitializeModuleDatatableLock() {
 	if (!acquireExclusive || !acquireShared || !releaseExclusive) return STATUS_NOT_SUPPORTED;
 
 #if !defined(MMPP_NO_DATATABLE_LOCK)
+	MmpInitFunctionTable(ntdll);
+
 	//
 	// A call site targets either the export itself or, on ARM64X, the ARM64EC
 	// body its fast-forward thunk jumps to. Accept both, or the ARM64EC decode
@@ -367,6 +526,7 @@ NTSTATUS NTAPI MmpInitializeModuleDatatableLock() {
 	MmpModuleDatatableLock = agreed;
 
 	MmpModuleDatatableLockRva = (LONG)((ULONG_PTR)agreed - (ULONG_PTR)ntdll);
+	MmpModuleDatatableLockAgreement = (LONG)agree;
 	MmpModuleDatatableLockLocated = 1;
 	return STATUS_SUCCESS;
 }

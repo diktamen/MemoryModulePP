@@ -62,11 +62,17 @@
 //   Acquires count of outermost acquisitions.
 //   Skipped  count of guard constructions that did nothing because the lock was
 //            never located.
+//   Rva      offset of the located lock within ntdll.
+//   Agreement how many donors agreed on it. Compare against the minimum of two:
+//            this is the early warning that a Windows update has started
+//            inlining the acquire in donor after donor, since the capability
+//            does not fail loudly -- it just stops locating the lock.
 //
 extern "C" __declspec(dllexport) volatile LONG MmpModuleDatatableLockLocated;
 extern "C" __declspec(dllexport) volatile LONG MmpModuleDatatableLockAcquires;
 extern "C" __declspec(dllexport) volatile LONG MmpModuleDatatableLockSkipped;
 extern "C" __declspec(dllexport) volatile LONG MmpModuleDatatableLockRva;
+extern "C" __declspec(dllexport) volatile LONG MmpModuleDatatableLockAgreement;
 
 //
 // Locate the lock. Call once from MmInitialize, with the loader lock already

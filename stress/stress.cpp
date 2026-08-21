@@ -577,9 +577,16 @@ int main(int argc, char** argv) {
         auto acquires = (volatile LONG*)GetProcAddress(mm, "MmpModuleDatatableLockAcquires");
         auto skipped = (volatile LONG*)GetProcAddress(mm, "MmpModuleDatatableLockSkipped");
         auto rva = (volatile LONG*)GetProcAddress(mm, "MmpModuleDatatableLockRva");
+        auto agree = (volatile LONG*)GetProcAddress(mm, "MmpModuleDatatableLockAgreement");
         if (located) {
             printf("  datatable lock    : %s", *located ? "LOCATED" : "NOT LOCATED (guards are no-ops)");
             if (*located && rva) printf(" at ntdll+0x%lX", (unsigned long)*rva);
+            //
+            // The margin above the two-donor minimum. Printed on every run
+            // because a shrinking margin is the only advance warning that a
+            // Windows update is inlining the acquire donor by donor.
+            //
+            if (*located && agree) printf("  (%ld donors agreed, need 2)", (long)*agree);
             printf("\n");
             if (acquires) printf("  datatable acquires: %ld\n", *acquires);
             if (skipped && *skipped) printf("  datatable skipped : %ld\n", *skipped);

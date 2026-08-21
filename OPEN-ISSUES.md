@@ -36,40 +36,69 @@ modules, and debuggers and profilers no longer enumerate them.
 
 ---
 
-## 2. The lock locator has thin margin, and fails silently
+## 2. The lock locator fails silently when it fails
 
-**Status:** working in five configurations, one build change away from switching
-itself off.
+**Status:** margin materially improved; the silent-failure mode remains.
 
 `LdrpModuleDatatableLock` is not exported, so it is located by decoding the
 instruction that sets the first argument of an exported SRW acquire inside an
-exported donor function. Several donors must agree. Measured coverage:
+exported donor function. Several donors must agree; the minimum accepted is two.
 
-| Configuration | donors decoding |
-| --- | --- |
-| native ARM64 (10.0.26100) | 3 of 5 |
-| x64 on ARM64X (10.0.26100) | **2 of 5** |
-| native x64 (Server 2022, 20348) | **2 of 5** |
-| native x64 (build `0x59A29EB0`) | 4 of 5 |
-| native x64 (build `0x6A51BE80`) | 3 of 5 |
+This used to be the second-worst item on the list, with two configurations
+sitting exactly at the minimum. Two changes fixed that:
 
-The minimum accepted is two. **Two configurations sit exactly at it.** Only
-`LdrQueryModuleServiceTags` decodes everywhere; every other donor fails in at
-least two configurations, and two of them work in exactly one. If a future
-Windows build inlines one more acquire, agreement drops below the minimum and the
-capability turns itself off.
+- **The x64 decoder now recurses**, as the ARM64 one always had. Most loader
+  exports do not take the lock themselves — they hand a caller-supplied handle
+  to an internal helper (`LdrpFindLoadedDllByHandle` and friends) and the acquire
+  happens down there. Without recursion those exports simply did not decode,
+  which is the entire reason genuine x64 scraped by on two donors. Recursion is
+  gated on ntdll's own `.pdata`, so a call target is followed only when the
+  exception directory confirms it is a function start; the same table bounds each
+  scan to the function it began in.
+- **The donor list was measured rather than guessed.** `lockprobe --survey`
+  decodes every named ntdll export and groups them by the address each yields;
+  the group containing the causality-verified lock is the complete set of usable
+  anchors on that build. Intersecting three configurations gave nine donors.
 
-That failure direction is deliberate — a wrong address acquired as an SRW lock
-would corrupt ntdll, which is worse than not locking — but it **presents as the
-original bug returning**, not as an error. Mitigations in place:
+| Configuration | before | after |
+| --- | --- | --- |
+| native ARM64 (10.0.26100) | 3 of 5 | **5 of 9** |
+| x64 on ARM64X (10.0.26100) | **2 of 5** | **5 of 9** |
+| native x64 (Server 2022, 20348) | **2 of 5** | **9 of 9** |
+| native x64 (build `0x59A29EB0`) | 4 of 5 | not re-measured |
+| native x64 (build `0x6A51BE80`) | 3 of 5 | not re-measured |
+
+Worst case is now five agreeing against a minimum of two, and three donors
+decode in every configuration instead of one. Every configuration resolved to
+**the same address it did before**, so the new machinery raised confidence
+without changing any answer, and no configuration produced a disagreeing vote.
+
+The last two rows are machines this session had no access to; they were 4 of 5
+and 3 of 5 on the old list and old decoder, so both should improve, but that is
+inference, not measurement.
+
+**What has not changed:** the failure is still silent. If a future Windows build
+inlines the acquire in donor after donor, agreement eventually drops below two
+and the capability turns itself off. That direction is deliberate — a wrong
+address acquired as an SRW lock would corrupt ntdll, which is worse than not
+locking — but it **presents as the original bug returning**, not as an error.
+Mitigations in place:
 
 - Never trim the donor list to whatever works on the machine in front of you.
-  It is the union across architectures and must stay that way.
-- The harness prints `datatable lock : LOCATED at ntdll+0x…` with an acquisition
-  count, or `NOT LOCATED (guards are no-ops)`. **Treat any `NOT LOCATED` run as a
-  non-result, never as a pass** — a no-op build still passes most runs.
-- Production code should read the exported `MmpModuleDatatableLockLocated` at
-  startup and decide for itself whether to proceed. Nothing does this yet.
+  Three entries carry ARM64 and two carry ARM64EC; trimming silently disables the
+  capability on an architecture you are not testing.
+- Two loader exports are deliberately *excluded*, `LdrGetDllHandle` and
+  `RtlQueueWorkItem`: the survey places both in the right group on some builds,
+  but under ARM64EC they decode to a different ntdll SRW lock. The plurality vote
+  exists to survive a stray answer like that, not to be fed them on purpose.
+- The harness prints the margin on every run —
+  `datatable lock : LOCATED at ntdll+0x… (5 donors agreed, need 2)` — or
+  `NOT LOCATED (guards are no-ops)`. **Treat any `NOT LOCATED` run as a
+  non-result, never as a pass**; a no-op build still passes most runs. A falling
+  donor count across Windows updates is the advance warning.
+- Production code should read the exported `MmpModuleDatatableLockLocated` and
+  `MmpModuleDatatableLockAgreement` at startup and decide for itself whether to
+  proceed. Nothing does this yet.
 
 **Not done:** no telemetry or hard failure when the lock cannot be found. The
 library currently loads and runs unsynchronized, exactly as before the fix.
@@ -255,3 +284,11 @@ creating a genuine AB-BA deadlock against any other thread. Same trigger.
 - **Do not read ntdll PE `TimeDateStamp` values as dates.** They are
   reproducible-build hashes. An earlier revision of the readme dated a Server
   2022 box to 2014 that way.
+- **On an unfamiliar build, run `lockprobe --survey` before guessing.** It
+  decodes every named ntdll export and groups them by the address each yields,
+  marking the group that passes the causality check. That group is the complete
+  anchor list for that build; the other groups are ntdll's other SRW locks, and
+  seeing them separate out is the evidence the decoder is discriminating rather
+  than emitting one answer for everything. Note that the *largest* group is not
+  the lock — on Server 2022 it is a 27-export group around an unrelated lock — so
+  pick the group by the causality mark, never by size.

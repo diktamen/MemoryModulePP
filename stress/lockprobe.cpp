@@ -45,6 +45,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 
 typedef VOID(NTAPI* PFN_SRW)(PVOID);
 
@@ -53,18 +54,23 @@ static void* g_acqTargets[4];
 static int   g_acqTargetCount = 0;
 
 //
-// Donors: exported, and each loads the lock into the first-argument register
-// immediately before an explicit call to an exported SRW acquire. Verified on
-// ARM64 10.0.26100.8972. Listed most-preferred first; any two agreeing is
-// enough.
+// Donors: exported ntdll functions from which the lock address can be decoded,
+// either because they take it themselves or because they call a helper that
+// does. Chosen from --survey output across three configurations rather than
+// guessed; keep in step with MmpLockDonors in ModuleDatatableLock.cpp, which
+// carries the table of which one decodes where. Any two agreeing is enough, and
+// the worst of the three configurations manages five.
 //
 static const char* kDonors[] = {
-    "LdrQueryModuleServiceTags",       // -> RtlAcquireSRWLockExclusive
-    "LdrDisableThreadCalloutsForDll",  // -> RtlAcquireSRWLockShared
-    "LdrGetDllHandleByMapping",        // -> RtlAcquireSRWLockShared
-    "LdrAddRefDll",                    // inlined acquire on ARM64; may be a
-                                       // plain call on x64, so worth trying
-    "LdrGetDllFullName",
+    "LdrQueryModuleServiceTags",       // all three configurations
+    "LdrGetDllHandleByMapping",        // all three
+    "LdrInitShimEngineDynamic",        // all three
+    "LdrGetDllHandleByName",           // x64, and x64 under ARM64X
+    "LdrGetDllHandleEx",               // x64, and x64 under ARM64X
+    "LdrAddRefDll",                    // x64 and native ARM64
+    "LdrDisableThreadCalloutsForDll",  // x64 and native ARM64
+    "LdrGetDllFullName",               // x64 only
+    "LdrFindEntryForAddress",          // x64 only
 };
 
 static bool IsAcquireTarget(const void* p) {
@@ -91,6 +97,103 @@ static bool IsEcFastForward(const void* p, void** jmpTarget) {
     int32_t rel; memcpy(&rel, b + 10, 4);
     if (jmpTarget) *jmpTarget = (void*)(b + 14 + rel);
     return true;
+}
+
+// ------------------------------------------------- ntdll function table (.pdata)
+
+//
+// Following a call means trusting an address we computed from bytes we have not
+// proved are an instruction. A byte scan hits plenty of 0xE8 bytes that are
+// really operands, and chasing those lands mid-instruction in unrelated code.
+//
+// The image already carries the answer: IMAGE_DIRECTORY_ENTRY_EXCEPTION lists
+// the start RVA of every function with unwind data. So "is this a real function
+// start" is a lookup, not a guess -- and the next entry's start bounds how far a
+// scan may run before it leaves the function it began in.
+//
+// Both x64 and ARM64 put BeginAddress first; only the entry stride differs (12
+// bytes vs 8). That is all we need, so no architecture-specific unwind decoding.
+//
+static const uint8_t* g_ntBase = nullptr;
+static size_t         g_ntSize = 0;
+static uint32_t*      g_fnStarts = nullptr;      // ascending, as stored in .pdata
+static size_t         g_fnCount = 0;
+static uint32_t       g_fnLow = 0, g_fnHigh = 0;
+
+static void InitFunctionTable(HMODULE nt) {
+    g_ntBase = (const uint8_t*)nt;
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)nt;
+    PIMAGE_NT_HEADERS h = (PIMAGE_NT_HEADERS)(g_ntBase + dos->e_lfanew);
+    g_ntSize = h->OptionalHeader.SizeOfImage;
+
+    IMAGE_DATA_DIRECTORY& dir =
+        h->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+    if (!dir.VirtualAddress || !dir.Size) return;
+
+    size_t stride = (h->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64) ? 12 : 8;
+    size_t count = dir.Size / stride;
+    if (!count) return;
+
+    g_fnStarts = (uint32_t*)malloc(count * sizeof(uint32_t));
+    if (!g_fnStarts) return;
+
+    const uint8_t* e = g_ntBase + dir.VirtualAddress;
+    size_t n = 0;
+    for (size_t i = 0; i < count; ++i) {
+        uint32_t begin;
+        memcpy(&begin, e + i * stride, 4);
+        if (!begin || begin >= g_ntSize) continue;
+        if (n && begin < g_fnStarts[n - 1]) continue;   // keep it ascending
+        g_fnStarts[n++] = begin;
+    }
+    g_fnCount = n;
+    if (n) { g_fnLow = g_fnStarts[0]; g_fnHigh = g_fnStarts[n - 1]; }
+}
+
+static bool IsFunctionStart(uint32_t rva) {
+    size_t lo = 0, hi = g_fnCount;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (g_fnStarts[mid] == rva) return true;
+        if (g_fnStarts[mid] < rva) lo = mid + 1; else hi = mid;
+    }
+    return false;
+}
+
+//
+// How far a scan starting at rva may run without crossing into the next
+// function. Returns cap when the table cannot say.
+//
+static size_t FunctionExtent(uint32_t rva, size_t cap) {
+    if (!g_fnCount || rva < g_fnLow || rva > g_fnHigh) return cap;
+    size_t lo = 0, hi = g_fnCount;
+    while (lo < hi) {                                   // first start above rva
+        size_t mid = lo + (hi - lo) / 2;
+        if (g_fnStarts[mid] <= rva) lo = mid + 1; else hi = mid;
+    }
+    if (lo >= g_fnCount) return cap;
+    size_t span = g_fnStarts[lo] - rva;
+    return span && span < cap ? span : cap;
+}
+
+//
+// Whether a computed call target is worth recursing into. Certain when the
+// function table covers the address; a shape check otherwise, because ARM64X
+// keeps x64/EC bodies outside the native .pdata this parses.
+//
+static bool IsFollowable(const void* target) {
+    if (!g_ntBase) return false;
+    ULONG_PTR t = (ULONG_PTR)target, b = (ULONG_PTR)g_ntBase;
+    if (t < b || t + 16 >= b + g_ntSize) return false;
+
+    uint32_t rva = (uint32_t)(t - b);
+    if (g_fnCount) {
+        if (IsFunctionStart(rva)) return true;
+        if (rva >= g_fnLow && rva <= g_fnHigh) return false;   // covered, not a start
+    }
+    if ((rva & 0xF) == 0) return true;                  // aligned function start
+    const uint8_t* p = (const uint8_t*)target;          // rva is not page-aligned
+    return p[-1] == 0xCC || p[-1] == 0xC3;              // padding / end of previous
 }
 
 // ------------------------------------------------------------- ARM64 decoding
@@ -165,24 +268,47 @@ static void* DecodeArm64(const void* fn, size_t maxInsns, int depth) {
 // SRW acquire, then look back a short way for the instruction that loaded RCX.
 // Both `lea rcx,[rip+d]` (48 8D 0D) and `mov rcx, imm64` (48 B9) are accepted.
 //
-static void* DecodeX64(const void* fn, size_t window) {
+// depth mirrors what DecodeArm64 has always done, and is what took the genuine
+// x64 hosts from two donors to most of them. Only LdrQueryModuleServiceTags and
+// LdrAddRefDll take the lock in the exported function itself; the rest hand a
+// caller-supplied handle to an internal helper -- LdrpFindLoadedDllByHandle and
+// friends -- and the acquire happens there. Without recursion those exports read
+// as "NO MATCH" and the vote had two donors to work with on Server 2022.
+//
+// Unlike ARM64, where a BL is unambiguous, an 0xE8 found by byte scanning may be
+// an operand byte rather than an opcode, so recursion is gated on IsFollowable.
+//
+static void* DecodeX64(const void* fn, size_t window, int depth) {
     const uint8_t* p = (const uint8_t*)fn;
+    int followed = 0;
+
+    ULONG_PTR b = (ULONG_PTR)g_ntBase;
+    if (g_ntBase && (ULONG_PTR)p >= b && (ULONG_PTR)p < b + g_ntSize)
+        window = FunctionExtent((uint32_t)((ULONG_PTR)p - b), window);
 
     for (size_t i = 0; i + 5 <= window; ++i) {
-        if (p[i] != 0xE8) continue;                              // call rel32
+        if (p[i] != 0xE8 && p[i] != 0xE9) continue;              // call/jmp rel32
         int32_t rel; memcpy(&rel, p + i + 1, 4);
-        if (!IsAcquireTarget(p + i + 5 + rel)) continue;
+        const uint8_t* target = p + i + 5 + rel;
 
-        for (size_t back = 3; back <= 64 && back <= i; ++back) {
-            const uint8_t* q = p + i - back;
-            if (q[0] == 0x48 && q[1] == 0x8D && q[2] == 0x0D) {  // lea rcx,[rip+d]
-                int32_t d; memcpy(&d, q + 3, 4);
-                return (void*)(q + 7 + d);
+        if (IsAcquireTarget(target)) {
+            for (size_t back = 3; back <= 64 && back <= i; ++back) {
+                const uint8_t* q = p + i - back;
+                if (q[0] == 0x48 && q[1] == 0x8D && q[2] == 0x0D) {  // lea rcx,[rip+d]
+                    int32_t d; memcpy(&d, q + 3, 4);
+                    return (void*)(q + 7 + d);
+                }
+                if (q[0] == 0x48 && q[1] == 0xB9) {              // mov rcx, imm64
+                    uint64_t v; memcpy(&v, q + 2, 8);
+                    return (void*)v;
+                }
             }
-            if (q[0] == 0x48 && q[1] == 0xB9) {                  // mov rcx, imm64
-                uint64_t v; memcpy(&v, q + 2, 8);
-                return (void*)v;
-            }
+            continue;         // acquire on a register we cannot source; keep looking
+        }
+
+        if (depth > 0 && followed < 8 && IsFollowable(target)) {
+            ++followed;
+            if (void* r = DecodeX64(target, 1024, depth - 1)) return r;
         }
     }
     return nullptr;
@@ -214,23 +340,134 @@ static void PrintNtdllIdentity(HMODULE nt) {
 // and scanning ARM64 bytes with the x64 decoder can wander, so a fault here is
 // a normal outcome and must not take the process down.
 //
-static void DecodeAny(const void* at, bool isEc, void** lockOut, const char** howOut) {
+static void DecodeAny(const void* at, bool isEc, int depth,
+                      void** lockOut, const char** howOut) {
     *lockOut = nullptr;
     *howOut = "none";
     __try {
         if (isEc) {
             // ARM64EC body: ARM64 instructions, acquire up to two calls deeper.
-            if ((*lockOut = DecodeArm64(at, 256, 2)) != nullptr) { *howOut = "arm64ec"; return; }
-            if ((*lockOut = DecodeX64(at, 512)) != nullptr) { *howOut = "x64"; return; }
+            if ((*lockOut = DecodeArm64(at, 256, depth)) != nullptr) { *howOut = "arm64ec"; return; }
+            if ((*lockOut = DecodeX64(at, 512, depth)) != nullptr) { *howOut = "x64"; return; }
         }
         else {
-            if ((*lockOut = DecodeX64(at, 512)) != nullptr) { *howOut = "x64"; return; }
-            if ((*lockOut = DecodeArm64(at, 256, 0)) != nullptr) { *howOut = "arm64"; return; }
+            if ((*lockOut = DecodeX64(at, 512, depth)) != nullptr) { *howOut = "x64"; return; }
+            if ((*lockOut = DecodeArm64(at, 256, depth)) != nullptr) { *howOut = "arm64"; return; }
         }
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         *lockOut = nullptr;
         *howOut = "fault";
+    }
+}
+
+// --------------------------------------------------------------- anchor survey
+
+//
+// Decode every named export instead of a hand-picked few, and group the results
+// by the address each one yields. This is how the donor list gets chosen: run it
+// on a build, and the bucket that survives the causality check below lists, by
+// name, every export on that build that is a usable anchor. Intersect those
+// lists across builds and the result is a donor set that does not depend on one
+// compiler's inlining decisions.
+//
+// Buckets other than the winner are ntdll's other SRW locks -- the notification
+// lock, the TLS lock, and so on. Seeing them is useful: it shows the decoder is
+// discriminating between locks rather than emitting one answer for everything.
+//
+struct Bucket {
+    void* lock;
+    int   count;
+    int   shallow;                  // how many needed no recursion
+    const char* names[64];
+    bool  namesShallow[64];
+    int   nameCount;
+};
+
+static Bucket g_buckets[64];
+static int    g_bucketCount = 0;
+
+static void RecordAnchor(void* lock, const char* name, bool shallow) {
+    Bucket* b = nullptr;
+    for (int i = 0; i < g_bucketCount; ++i)
+        if (g_buckets[i].lock == lock) { b = &g_buckets[i]; break; }
+    if (!b) {
+        if (g_bucketCount == (int)(sizeof(g_buckets) / sizeof(g_buckets[0]))) return;
+        b = &g_buckets[g_bucketCount++];
+        b->lock = lock; b->count = 0; b->shallow = 0; b->nameCount = 0;
+    }
+    ++b->count;
+    if (shallow) ++b->shallow;
+    if (b->nameCount < (int)(sizeof(b->names) / sizeof(b->names[0]))) {
+        b->namesShallow[b->nameCount] = shallow;
+        b->names[b->nameCount++] = name;
+    }
+}
+
+//
+// Returns the address the most exports agree on, or null. Also fills the
+// buckets, which main prints.
+//
+static void* SurveyExports(HMODULE nt, int* scanned) {
+    *scanned = 0;
+
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)nt;
+    PIMAGE_NT_HEADERS h = (PIMAGE_NT_HEADERS)((BYTE*)nt + dos->e_lfanew);
+    IMAGE_DATA_DIRECTORY& d =
+        h->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!d.VirtualAddress) return nullptr;
+
+    PIMAGE_EXPORT_DIRECTORY ed =
+        (PIMAGE_EXPORT_DIRECTORY)((BYTE*)nt + d.VirtualAddress);
+    DWORD* nameRvas = (DWORD*)((BYTE*)nt + ed->AddressOfNames);
+    WORD* ordinals = (WORD*)((BYTE*)nt + ed->AddressOfNameOrdinals);
+    DWORD* funcRvas = (DWORD*)((BYTE*)nt + ed->AddressOfFunctions);
+
+    for (DWORD i = 0; i < ed->NumberOfNames; ++i) {
+        const char* name = (const char*)nt + nameRvas[i];
+        DWORD rva = funcRvas[ordinals[i]];
+        // A function RVA inside the export directory is a forwarder string.
+        if (rva >= d.VirtualAddress && rva < d.VirtualAddress + d.Size) continue;
+
+        void* fn = (BYTE*)nt + rva;
+        void* ecTarget = nullptr;
+        bool isThunk = IsEcFastForward(fn, &ecTarget);
+        const void* at = isThunk ? ecTarget : fn;
+
+        ++*scanned;
+
+        void* shallowLock = nullptr; const char* how = "none";
+        DecodeAny(at, isThunk, 0, &shallowLock, &how);
+        void* deepLock = shallowLock;
+        if (!deepLock) DecodeAny(at, isThunk, 2, &deepLock, &how);
+        if (deepLock) RecordAnchor(deepLock, name, shallowLock != nullptr);
+    }
+
+    void* best = nullptr; int bestCount = 0;
+    for (int i = 0; i < g_bucketCount; ++i)
+        if (g_buckets[i].count > bestCount) { bestCount = g_buckets[i].count; best = g_buckets[i].lock; }
+    return best;
+}
+
+static void PrintBuckets(HMODULE nt, void* verified) {
+    // Descending by size, selection-sort style -- at most a few dozen buckets.
+    bool done[64] = { false };
+    for (int rank = 0; rank < g_bucketCount; ++rank) {
+        int pick = -1;
+        for (int i = 0; i < g_bucketCount; ++i)
+            if (!done[i] && (pick < 0 || g_buckets[i].count > g_buckets[pick].count)) pick = i;
+        if (pick < 0) break;
+        done[pick] = true;
+        Bucket& b = g_buckets[pick];
+
+        printf("\nntdll+0x%llX  -- %d export%s (%d without recursion)%s\n",
+            (unsigned long long)((BYTE*)b.lock - (BYTE*)nt),
+            b.count, b.count == 1 ? "" : "s", b.shallow,
+            b.lock == verified ? "   <== LdrpModuleDatatableLock (verified)" : "");
+        for (int i = 0; i < b.nameCount; ++i)
+            printf("    %-40s %s\n", b.names[i], b.namesShallow[i] ? "direct" : "via helper");
+        if (b.count > b.nameCount)
+            printf("    ... and %d more\n", b.count - b.nameCount);
     }
 }
 
@@ -333,10 +570,15 @@ static bool VerifyByCausality(void* candidate) {
 // ---------------------------------------------------------------------- main
 
 int main(int argc, char** argv) {
-    bool dumpAlways = (argc > 1 && !strcmp(argv[1], "--dump"));
+    bool dumpAlways = false, survey = false;
+    for (int i = 1; i < argc; ++i) {
+        if (!strcmp(argv[i], "--dump")) dumpAlways = true;
+        else if (!strcmp(argv[i], "--survey")) survey = true;
+    }
 
     HMODULE nt = GetModuleHandleW(L"ntdll.dll");
     if (!nt) { printf("no ntdll\n"); return 2; }
+    InitFunctionTable(nt);
 
     g_acqExcl = (PFN_SRW)GetProcAddress(nt, "RtlAcquireSRWLockExclusive");
     g_acqShared = (PFN_SRW)GetProcAddress(nt, "RtlAcquireSRWLockShared");
@@ -365,6 +607,8 @@ int main(int argc, char** argv) {
     if (IsEcFastForward((void*)g_acqShared, &t)) g_acqTargets[g_acqTargetCount++] = t;
 
     printf("SRW acquire     : excl=%p shared=%p\n", (void*)g_acqExcl, (void*)g_acqShared);
+    printf("function table  : %llu entries (ntdll+0x%X .. +0x%X)\n",
+        (unsigned long long)g_fnCount, g_fnLow, g_fnHigh);
     printf("\n--- donors ---\n");
 
     void* agreed = nullptr;
@@ -394,11 +638,14 @@ int main(int argc, char** argv) {
 
         void* lock = nullptr;
         const char* how = "none";
-        DecodeAny(decodeAt, isThunk, &lock, &how);
+        int usedDepth = 0;
+        DecodeAny(decodeAt, isThunk, 0, &lock, &how);
+        if (!lock) { usedDepth = 2; DecodeAny(decodeAt, isThunk, 2, &lock, &how); }
 
         if (lock) {
             ++matched;
-            printf("  decoded via   : %s\n", how);
+            printf("  decoded via   : %s%s\n", how,
+                usedDepth ? " (acquire is in a callee)" : "");
             printf("  LOCK          : %p  (ntdll+0x%llX)\n",
                 lock, (unsigned long long)((BYTE*)lock - (BYTE*)nt));
             if (!agreed) { agreed = lock; agree = 1; }
@@ -437,6 +684,19 @@ int main(int argc, char** argv) {
 
     printf("\n--- causality check ---\n");
     bool ok = VerifyByCausality(agreed);
+
+    if (survey) {
+        printf("\n--- anchor survey: every named export, grouped by lock ---\n");
+        int scanned = 0;
+        void* top = SurveyExports(nt, &scanned);
+        printf("exports scanned : %d\n", scanned);
+        printf("distinct locks  : %d\n", g_bucketCount);
+        if (top && top != agreed)
+            printf("note            : most-referenced address is ntdll+0x%llX, "
+                   "not the verified lock\n",
+                   (unsigned long long)((BYTE*)top - (BYTE*)nt));
+        PrintBuckets(nt, ok ? agreed : nullptr);
+    }
 
     printf("\nRESULT: %s\n", (ok && accepted)
         ? "VERIFIED -- this is LdrpModuleDatatableLock, and the library will use it"
