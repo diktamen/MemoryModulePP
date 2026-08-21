@@ -153,6 +153,23 @@ BOOL NTAPI RtlInitializeLdrDataTableEntry(
 		entry->ImageDll = entry->LoadNotificationsSent = entry->EntryProcessed =
 			entry->InLegacyLists = entry->InIndexes = true;
 		entry->ProcessAttachCalled = false;
+
+		//
+		// Opt out of ntdll's per-thread DllMain notifications, the same thing
+		// DisableThreadLibraryCalls() does for a normally loaded DLL.
+		//
+		// We are linked into InInitializationOrderModuleList, so without this
+		// ntdll calls this module's entry point with DLL_THREAD_ATTACH every time
+		// any thread starts, on threads and at times we do not control -- and
+		// notably from the loader worker threads that ntdll spins up to service
+		// ordinary LoadLibrary calls. Because the image and this entry are freed
+		// by us rather than by the OS loader, such a notification can land on a
+		// module that is being torn down, and ntdll then calls an entry point in
+		// released memory. Under page heap that reproduced as execution at an
+		// address with no owning module, dispatched from inside ntdll's thread
+		// initialization path.
+		//
+		entry->DontCallForThreads = true;
 		entry->InExceptionTable = !(dwFlags & LOAD_FLAGS_NOT_ADD_INVERTED_FUNCTION);
 		entry->CorImage = CorImage;
 		entry->CorILOnly = CorIL;
