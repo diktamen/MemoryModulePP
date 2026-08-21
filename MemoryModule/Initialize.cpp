@@ -591,16 +591,47 @@ extern "C" __declspec(dllexport) BOOL WINAPI ReflectiveMapDll(HMODULE hModule) {
 	PMEMORYMODULE module = MapMemoryModuleHandle(hModule);
 	if (!module)return FALSE;
 
-	PLDR_DATA_TABLE_ENTRY ModuleEntry;
+	//
+	// Everything below publishes into structures ntdll's own loader mutates, so
+	// it runs under the loader lock like every other publish path in this
+	// library. DllMain already holds it when the reflective loader arrives here,
+	// but this function is exported and can be called with nothing held; the
+	// lock is recursive, so covering both cases costs nothing.
+	//
+	MmpLoaderLockGuard loaderLock;
+
+	PLDR_DATA_TABLE_ENTRY ModuleEntry = nullptr;
 	status = LdrMapDllMemory(hModule, 0, nullptr, nullptr, &ModuleEntry);
 	if (!NT_SUCCESS(status))return FALSE;
 
-	status = RtlInsertInvertedFunctionTable(hModule, headers->OptionalHeader.SizeOfImage);
-	if (!NT_SUCCESS(status)) return FALSE;
-
-	module->InsertInvertedFunctionTableEntry = true;
+	//
+	// Record the publish before anything else can fail. These two are what the
+	// teardown below -- and any later unload -- read to know there is a loader
+	// entry to unlink; setting them only at the end left a failed call with the
+	// module in ntdll's three lists and its base-address index, and nothing
+	// anywhere able to tell. Loader.cpp sets them in the same position for the
+	// same reason.
+	//
 	module->MappedDll = true;
 	module->LdrEntry = ModuleEntry;
+
+	//
+	// MmpRegisterExceptionTable, not RtlInsertInvertedFunctionTable: on x64 that
+	// publishes through RtlAddFunctionTable instead of editing ntdll's .mrdata
+	// inverted table, whose page flip races ntdll's own no matter what lock we
+	// hold. This was the last caller of the direct edit on a live path. It also
+	// pairs with the MmpUnregisterExceptionTable that unload runs when
+	// InsertInvertedFunctionTableEntry is set, which the old call did not.
+	//
+	status = MmpRegisterExceptionTable(hModule, headers->OptionalHeader.SizeOfImage);
+	if (!NT_SUCCESS(status)) {
+		if (!RtlFreeLdrDataTableEntry(ModuleEntry)) __fastfail(FAST_FAIL_FATAL_APP_EXIT);
+		module->LdrEntry = nullptr;
+		module->MappedDll = false;
+		return FALSE;
+	}
+
+	module->InsertInvertedFunctionTableEntry = true;
 
 	return TRUE;
 }

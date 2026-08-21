@@ -190,7 +190,7 @@ rest of the ntdll internals this library depends on are not:
 | --- | --- | --- |
 | `LdrpHandleTlsData` | multi-stage pattern scan over `.rdata`/`.text`, plus hardcoded prologue offsets for 6.1/6.2/6.3 | high; x86 unsupported; Win11 uses the Win10 signature because it reports major version 10 |
 | `LdrpReleaseTlsEntry` | a single hardcoded 21-byte signature, x64 Windows 10 only | high |
-| `LdrpInvertedFunctionTable` | byte-pattern scan with hardcoded struct offsets and a hardcoded `MaxCount` of `0x200` | medium; only reachable via `ReflectiveMapDll` now |
+| `LdrpInvertedFunctionTable` | byte-pattern scan with hardcoded struct offsets and a hardcoded `MaxCount` of `0x200` | low on x64: since issue 8, no live caller remains there. x86 still reaches it through `MmpRegisterExceptionTable`'s fallback |
 | `LdrpModuleBaseAddressIndex` | structural derivation, then an address-value scan of `.data` | medium, plus issue 7 |
 | `LdrpHashTable` | structural derivation, validated by re-hashing every entry | low; located but deliberately never written |
 
@@ -229,20 +229,47 @@ Nondeterministic, and it will look like a flaky bug.
 
 ---
 
-## 8. `ReflectiveMapDll` publishes with no loader lock at all
+## 8. `ReflectiveMapDll` publishes with no loader lock at all — FIXED
 
-**Status:** open; reachable in the DLL build.
+**Status:** fixed; correct by inspection and consistent with the main load path,
+but the reflective path itself is still not exercised by any test.
 
-`Initialize.cpp`'s `ReflectiveMapDll` reaches `LdrMapDllMemory` — three
+`Initialize.cpp`'s `ReflectiveMapDll` reached `LdrMapDllMemory` — three
 `InsertTailList` calls plus the base-address index — and
-`RtlInsertInvertedFunctionTable`, a direct `.mrdata` edit still live on that path,
-with **no `MmpLoaderLockGuard` anywhere on the call chain**, and it never tears
-any of it down. It also hits the equal-base branch of issue 7.
+`RtlInsertInvertedFunctionTable` with **no `MmpLoaderLockGuard` anywhere on the
+call chain**, and never tore any of it down. Three changes:
 
-It gets the datatable lock for free, because those guards live inside the callees
-rather than at the call site, so the worst of it is now covered. The missing
-loader lock and the absent teardown are not. Reachable whenever `DllMain` sees
-`lpReserved == (PVOID)-1`, or if anyone calls the exported `ReflectiveMapDll`.
+1. **The publish now runs under `MmpLoaderLockGuard`,** covering both the
+   `LdrMapDllMemory` publish and the exception-table registration, which is the
+   same shape `LdrLoadDllMemoryExW` has used since the lock work. In the
+   `DllMain` path ntdll already holds that lock, so it is a recursive re-acquire
+   and changes nothing; the exposure was the exported entry point, callable with
+   nothing held.
+2. **`RtlInsertInvertedFunctionTable` → `MmpRegisterExceptionTable`.** This was
+   the last live caller of the direct `.mrdata` edit. On x64 the replacement
+   publishes through `RtlAddFunctionTable` instead, avoiding a page flip that
+   races ntdll's own *regardless of what lock is held* — see the comment above
+   `MmpRegisterExceptionTable` for why the main path was migrated off it. It also
+   pairs correctly with the `MmpUnregisterExceptionTable` that unload runs when
+   `InsertInvertedFunctionTableEntry` is set; the old call did not, so the flag
+   and its teardown named different primitives. On x86 it forwards to the old
+   path, so nothing changes there.
+3. **`MappedDll` and `LdrEntry` are set immediately after the publish** rather
+   than at the very end, and a failed registration now unlinks the loader entry
+   before returning. Previously a failure after `LdrMapDllMemory` succeeded left
+   the module in ntdll's three lists and its base-address index with those fields
+   still clear — so nothing, anywhere, could tell there was anything to unlink.
+
+**Not covered by a test.** The reflective path runs only when `DllMain` sees
+`lpReserved == (PVOID)-1`, which means a real reflective-injection harness; the
+stress bench never reaches it. The build is verified and the normal load path is
+unaffected (stress clean on arm64 and x64), but that is a regression check, not
+evidence about this code.
+
+Still open here: **the equal-base branch of issue 7.** That is only reachable by
+calling the exported `ReflectiveMapDll` on a module ntdll has already loaded — a
+genuine reflective load has no existing entry for that base — but the export
+makes it reachable, and nothing rejects it.
 
 ---
 
