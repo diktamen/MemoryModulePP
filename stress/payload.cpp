@@ -19,7 +19,15 @@ static volatile LONG g_threadAttachCount = 0;
 // Forces a TLS directory into the image, so the load path runs
 // MmpHandleTlsData()/LdrpHandleTlsData() instead of skipping it.
 //
+#ifdef STRESS_NO_TLS
+//
+// No TLS directory in the image, so the loader TLS path is a no-op. Used to test
+// whether holding the loader lock across MmpHandleTlsData() is what deadlocks.
+//
+static volatile int t_tlsSlot = 0;
+#else
 static thread_local volatile int t_tlsSlot = 0;
+#endif
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
     UNREFERENCED_PARAMETER(hModule);

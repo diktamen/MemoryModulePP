@@ -64,6 +64,21 @@ if errorlevel 1 (
     exit /b 1
 )
 
+echo === building no-TLS payload variant ===
+rem
+rem Same source without thread_local, so the image carries no TLS directory and
+rem the loader TLS path is skipped entirely. Pass it via --payload to test
+rem whether TLS handling is involved in a failure.
+rem
+cl /nologo /std:c++17 /O2 /MT /EHsc /LD /DSTRESS_NO_TLS ^
+    /Fo"%OUT%\payload_notls.obj" /Fd"%OUT%\payload_notls.pdb" ^
+    "%~dp0payload.cpp" ^
+    /link /OUT:"%OUT%\stresspayload_notls.dll" /IMPLIB:"%OUT%\stresspayload_notls.lib"
+if errorlevel 1 (
+    echo error: no-TLS payload build failed.
+    exit /b 1
+)
+
 echo === building stress harness ===
 cl /nologo /std:c++17 /O2 /MT /EHsc ^
     /Fo"%OUT%\stress.obj" /Fd"%OUT%\stress.pdb" ^
@@ -72,6 +87,24 @@ cl /nologo /std:c++17 /O2 /MT /EHsc ^
 if errorlevel 1 (
     echo error: stress harness build failed.
     exit /b 1
+)
+
+rem
+rem Diagnostic variants. These are byte-identical copies of stress.exe; the only
+rem thing that differs is the file name, which is what gflags keys its Image File
+rem Execution Options on. So switching between clean, heap-checking, page-heap and
+rem loader-snap runs is just a matter of running a different name -- no elevation
+rem at run time.
+rem
+rem Register them once with scratchpad\gflags-setup.ps1 (elevated). See that
+rem script for what each name carries. stress.exe is deliberately left clean and
+rem is the only variant whose timings are meaningful.
+rem
+rem The copies keep stress.exe's debug directory, so they still resolve
+rem stress.pdb and stacks stay symbolised.
+rem
+for %%v in (stress_htc stress_hvc stress_ph stress_phf stress_phb stress_sls stress_soe) do (
+    copy /y "%OUT%\stress.exe" "%OUT%\%%v.exe" >nul
 )
 
 rem

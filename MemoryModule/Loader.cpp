@@ -230,7 +230,26 @@ NTSTATUS NTAPI LdrLoadDllMemoryExW(
 		module->MappedDll = true;
 		module->LdrEntry = ModuleEntry;
 
+		//
+		// Resolve imports with the loader lock dropped.
+		//
+		// Import resolution calls LoadLibrary for each dependency, and calling
+		// LoadLibrary while holding the loader lock is the classic way to
+		// deadlock on Windows 8 and later: ntdll services a load using worker
+		// threads that need the loader lock themselves, so a holder that waits
+		// on one waits forever. Recursive acquisition does not help, because the
+		// thread that has to make progress is not this one.
+		//
+		// Dropping it here is safe for what the lock was taken for. The
+		// check-then-act window that must be atomic is the duplicate scan
+		// through the LdrMapDllMemory() publish above, and that is complete: the
+		// module is already in the loader lists, which is also what lets a
+		// circular import find it. From here on this thread is only touching its
+		// own module.
+		//
+		loaderLock.Release();
 		status = MemoryResolveImportTable(LPBYTE(*BaseAddress), headers, module);
+		loaderLock.Reacquire();
 		if (!NT_SUCCESS(status))break;
 
 		status = MemorySetSectionProtection(LPBYTE(*BaseAddress), headers);

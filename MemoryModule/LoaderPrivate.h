@@ -38,6 +38,20 @@ struct MmpLoaderLockGuard {
 		}
 	}
 
+	//
+	// Retake the lock after a Release(). Used to step around a region that must
+	// not run with the loader lock held, such as one that calls LoadLibrary().
+	//
+	void Reacquire() {
+		if (Held) return;
+		ULONG disposition = LDR_LOCK_LOADER_LOCK_DISPOSITION_INVALID;
+		Cookie = nullptr;
+		if (NT_SUCCESS(LdrLockLoaderLock(0, &disposition, &Cookie)) &&
+			disposition == LDR_LOCK_LOADER_LOCK_DISPOSITION_LOCK_ACQUIRED) {
+			Held = true;
+		}
+	}
+
 	MmpLoaderLockGuard(const MmpLoaderLockGuard&) = delete;
 	MmpLoaderLockGuard& operator=(const MmpLoaderLockGuard&) = delete;
 };

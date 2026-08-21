@@ -12,68 +12,61 @@ instead of by reading.
 
 ## What is currently broken
 
-**Where it stands.** Clean through 8 loader threads plus 8 noise threads.
-Marginal at 16 plus 8. Reliably broken at 24 plus 12, which is where work
-stopped.
+**Where it stands.** Clean at 24 loader threads plus 12 noise threads over 100
+iterations, 6/6. At 200 iterations, 3/4, with one `__fastfail`. That fast-fail is
+the only open bug.
 
-**The failure mode changed once, and that matters.** Until `00ed378` the 24-thread
-configuration died with `STATUS_HEAP_CORRUPTION` (`0xC0000374`), a fast-fail with
-no stack. Page heap identified the cause: ntdll was calling a module entry point
-in memory that had already been released, dispatched from its thread
-initialization path, because memory modules never set `DontCallForThreads` and so
-received `DLL_THREAD_ATTACH` on threads we do not control. `00ed378` sets that
-flag. The heap corruption has not recurred since.
+**Symptom.** Exit `0xC0000409` (`STATUS_STACK_BUFFER_OVERRUN`), which here is
+`__fastfail`, not a stack overrun. MemoryModulePP calls it from several
+invariant checks and it bypasses SEH entirely, so no handler and no crash
+reporter output; only the exit code shows it. Candidate sites, all bar one in
+the unload path:
 
-**What replaced it is a deadlock**, and whether that is progress is genuinely
-unresolved. Two readings fit the evidence equally well: either the corruption was
-killing the process before a pre-existing deadlock could form, and fixing it
-merely exposed the next bug; or the flag itself introduced the hang. Against the
-first reading, 16+8 also went from 3/3 clean to 2/3, which is a small sample but
-the wrong direction. **Do not treat `00ed378` as validated.** Deciding between
-those two readings is the next task, and reverting it to re-measure is a
-legitimate way to start.
+- `LdrUnloadDllMemory`, `SizeOfImage` disagreeing with the loader entry
+- `MmpUnregisterExceptionTable` failing (`FAST_FAIL_CORRUPT_LIST_ENTRY`)
+- `MmpReleaseTlsEntry` failing
+- `RtlFreeLdrDataTableEntry` failing
+- `MemoryFreeLibrary` failing
+- `LdrLoadDllMemoryExW`, `MapMemoryModuleHandle` returning null after a
+  successful map
 
-At the hang, 18 threads sit in `LdrpCallInitializers` running a payload
-`DllMain` (process attach) and 6 in `LdrUnloadDllMemory` running one (process
-detach). Both run outside the loader lock by design. The payload frames are
-misattributed by cdb to its only export; they are really its static CRT.
+It does not reproduce under `cdb`. Narrowing it needs either a post-mortem dump
+or replacing the blind `__fastfail` calls with something that records which
+check fired.
 
-**Conditions required to reproduce the 24-thread failure.** Both together:
+### Correction: there was never a deadlock here
 
-- **Many loader threads each mapping a *distinct* image.** 24 threads in
-  `--mode distinct` reproduces; 16 threads mostly does not.
-- **Concurrent ordinary `LoadLibrary`/`FreeLibrary` traffic.** With `--noise 0`
-  the same 24 threads are clean.
+An earlier version of this document reported a deadlock at 24 threads and
+doubted `00ed378` because of it. **That was a measurement error, and the
+conclusion drawn from it was wrong.** Runs at 24+12 legitimately take 54s at 100
+iterations and 110s at 200; they were being killed at a 60 or 90 second timeout
+and scored as hangs. With a 300 second timeout the same configuration passes.
 
-**Conditions ruled out.** Each was tested and is *not* involved:
+Two things follow. `00ed378` (`DontCallForThreads`) is **not** suspect: it fixed
+the heap corruption, which has not recurred, and the hang it appeared to cause
+did not exist. And the loader lock is heavily contended at this load --
+`ntdll!LdrpLoaderLock` showed a contention count of 4250 -- so runs get slow, not
+stuck. When a dump showed 18 threads in `LdrpCallInitializers` and 6 in
+`LdrUnloadDllMemory`, all waiting while one noise thread held the loader lock
+inside `NtUnmapViewOfSection`, that was ordinary contention, not a cycle.
+
+**Lesson for anyone running this: scale the timeout with the load.** 300s at 24
+threads. A verdict of "hang" is only meaningful once you have confirmed the same
+configuration can finish at all.
+
+### Ruled out for the fast-fail
 
 | Hypothesis | Test | Result |
 | --- | --- | --- |
-| Shared-module reference counting | `--mode same --threads 24 --noise 12` | 3/3 pass, not this |
-| The exception / function-table path | `--mode mixed --threads 24 --noise 12 --no-ift` | still fails, not this |
-| Concurrency alone, without real DLL loads | `--mode mixed --threads 24 --noise 0` | 3/3 pass, noise is required |
-| The OS loader mishandling parallel loads | `--threads 0 --noise 8` | 2943 loads, 0 failures, the OS is fine |
+| Loader TLS handling | payload built without `thread_local`, so no TLS directory | identical, not this |
+| Loader lock held across import resolution | released around `MemoryResolveImportTable` | identical, not this |
 
-Measured, 3 runs each, 200 iterations per thread:
-
-```
-24L + 12N distinct         0/3 pass    3 heap corruption   <-- the target
-24L + 12N same             3/3 pass
-24L +  0N mixed            3/3 pass
-24L + 12N mixed --no-ift   0/3 pass    1 heap, 1 crash, 1 hang
-16L +  8N mixed            3/3 pass
-```
-
-**Where that points.** Distinct images share no `MEMORYMODULE` state, so the
-corruption is not in per-module bookkeeping. What they do share is the process
-heap and ntdll's loader database. The load/unload path allocates and frees
-several things on that heap: the `LDR_DATA_TABLE_ENTRY`, the `BaseDllName` and
-`FullDllName` buffers, and the `hModulesList` import-handle array. It also calls
-two ntdll internals located by signature scan, `LdrpHandleTlsData` and
-`LdrpReleaseTlsEntry`, which allocate and free ntdll's own TLS vectors on that
-same heap. Those internals have invariants we may not be honouring, and the
-noise DLLs reach the same structures through ntdll's supported path. That is the
-next thing to narrow.
+One control result is worth keeping permanently, because it is what makes every
+other verdict here trustworthy: `--threads 0 --noise 8` did 2943 ordinary
+`LoadLibrary`/`FreeLibrary` calls with 179 clean loader-list checks and zero
+failures. The OS loader handles parallel loads of different DLLs perfectly well,
+and the harness does not invent failures. Anything this bench reports needs
+MemoryModulePP in the mix.
 
 **Page heap.** `gflags /p /enable stress.exe /full` is what found the cause of the
 heap corruption, so it is worth reaching for again. Two things to know: it needs
@@ -152,6 +145,29 @@ was not published fails loudly instead of silently passing.
   scan and the reference-count path.
 - `--mode mixed` - half and half.
 
+### Diagnostic build variants
+
+`build.cmd` also emits byte-identical copies of `stress.exe` under other names.
+The only difference is the filename, which is what gflags keys Image File
+Execution Options on, so choosing a diagnostic mode is just choosing which name
+to run -- no elevation at run time. Register them once with
+`scratchpad\gflags-setup.ps1` (elevated; `-Off` removes them, `-Show` prints
+state without elevation).
+
+| Name | Carries |
+| --- | --- |
+| `stress.exe` | nothing; the only variant whose timings are meaningful |
+| `stress_htc.exe` | heap tail, free and parameter checking; catches overruns at free time, far cheaper than page heap |
+| `stress_hvc.exe` | validate the whole heap on every heap call; very slow, very thorough |
+| `stress_ph.exe` | standard page heap, pattern fill and check on free |
+| `stress_phf.exe` | full page heap, guard page after every block; faults on the overrunning instruction |
+| `stress_phb.exe` | full page heap with the guard page before the block, for underruns |
+| `stress_sls.exe` | loader snaps, traces ntdll loader activity to the debugger |
+| `stress_soe.exe` | stop on exception |
+
+The copies keep `stress.exe`'s debug directory, so they still resolve
+`stress.pdb` and stacks stay symbolised.
+
 ### Controls
 
 These exist to falsify hypotheses, and each has already paid for itself:
@@ -160,6 +176,9 @@ These exist to falsify hypotheses, and each has already paid for itself:
   machine: if this ever fails, the bug is not in MemoryModulePP.
 - `--no-ift` - loads with `LOAD_FLAGS_NOT_ADD_INVERTED_FUNCTION`, excluding all
   function-table work from the run.
+- `--payload stresspayload_notls.dll` - a variant of the payload built without
+  `thread_local`, so the image has no TLS directory and the loader TLS path is
+  skipped. Used to rule TLS handling out of a failure.
 - `--force-seh` - keeps the exception-raising probe even under `--no-ift`. Used to
   establish that publishing unwind info is load-bearing: without it, a memory
   module that raises crashes unhandled.
