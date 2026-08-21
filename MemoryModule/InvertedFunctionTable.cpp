@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "LoaderPrivate.h"
 
 //
 // LdrpInvertedFunctionTable is a process-global structure owned by ntdll.
@@ -8,32 +9,10 @@
 // loader lock races ntdll's concurrent DLL loads (e.g. an EDR agent or codec
 // loading on another thread): the entry count/array or the page protection are
 // observed mid-update, and the RtlMoveMemory() shift then runs with a corrupt
-// length and writes past the table. Take the loader lock for the whole
-// read-modify-write so we are mutually exclusive with ntdll. The lock is
-// recursive per-thread, so re-entering from within a load is safe.
+// length and writes past the table. Take the loader lock (MmpLoaderLockGuard,
+// declared in LoaderPrivate.h) for the whole read-modify-write so we are
+// mutually exclusive with ntdll.
 //
-namespace {
-	struct MmpLoaderLockGuard {
-		PVOID Cookie = nullptr;
-		bool Held = false;
-
-		MmpLoaderLockGuard() {
-			ULONG disposition = LDR_LOCK_LOADER_LOCK_DISPOSITION_INVALID;
-			if (NT_SUCCESS(LdrLockLoaderLock(0, &disposition, &Cookie)) &&
-				disposition == LDR_LOCK_LOADER_LOCK_DISPOSITION_LOCK_ACQUIRED) {
-				Held = true;
-			}
-		}
-		~MmpLoaderLockGuard() {
-			if (Held) {
-				LdrUnlockLoaderLock(0, Cookie);
-			}
-		}
-
-		MmpLoaderLockGuard(const MmpLoaderLockGuard&) = delete;
-		MmpLoaderLockGuard& operator=(const MmpLoaderLockGuard&) = delete;
-	};
-}
 
 static VOID RtlpInsertInvertedFunctionTable(
 	_In_ PRTL_INVERTED_FUNCTION_TABLE InvertedTable,

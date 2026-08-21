@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "LoaderPrivate.h"
 #include <cmath>
 
 #ifdef _USRDLL
@@ -44,20 +45,21 @@ NTSTATUS NTAPI LdrMapDllMemory(
 	return STATUS_SUCCESS;
 }
 
-NTSTATUS NTAPI LdrLoadDllMemoryExW(
+//
+// Probe the caller's buffers and out-parameters under SEH.
+//
+// This lives in its own function because MSVC forbids __try in a function that
+// requires object unwinding (C2712), and LdrLoadDllMemoryExW below needs an RAII
+// loader lock guard.
+//
+static NTSTATUS MmpValidateLoadDllMemoryParameters(
 	_Out_ HMEMORYMODULE* BaseAddress,
 	_Out_opt_ PVOID* LdrEntry,
 	_In_ DWORD dwFlags,
 	_In_ LPVOID BufferAddress,
-	_In_ size_t BufferSize,
-	_In_opt_ LPCWSTR DllName,
-	_In_opt_ LPCWSTR DllFullName) {
-	PMEMORYMODULE module = nullptr;
+	_In_ size_t BufferSize) {
 	NTSTATUS status = STATUS_SUCCESS;
-	PLDR_DATA_TABLE_ENTRY ModuleEntry = nullptr;
-	PIMAGE_NT_HEADERS headers = nullptr;
 
-	if (BufferSize)return STATUS_INVALID_PARAMETER_5;
 	__try {
 		*BaseAddress = nullptr;
 		if (LdrEntry)*LdrEntry = nullptr;
@@ -73,7 +75,43 @@ NTSTATUS NTAPI LdrLoadDllMemoryExW(
 	__except (EXCEPTION_EXECUTE_HANDLER) {
 		status = GetExceptionCode();
 	}
+
+	return status;
+}
+
+NTSTATUS NTAPI LdrLoadDllMemoryExW(
+	_Out_ HMEMORYMODULE* BaseAddress,
+	_Out_opt_ PVOID* LdrEntry,
+	_In_ DWORD dwFlags,
+	_In_ LPVOID BufferAddress,
+	_In_ size_t BufferSize,
+	_In_opt_ LPCWSTR DllName,
+	_In_opt_ LPCWSTR DllFullName) {
+	PMEMORYMODULE module = nullptr;
+	NTSTATUS status = STATUS_SUCCESS;
+	PLDR_DATA_TABLE_ENTRY ModuleEntry = nullptr;
+	PIMAGE_NT_HEADERS headers = nullptr;
+
+	if (BufferSize)return STATUS_INVALID_PARAMETER_5;
+
+	status = MmpValidateLoadDllMemoryParameters(BaseAddress, LdrEntry, dwFlags, BufferAddress, BufferSize);
 	if (!NT_SUCCESS(status))return status;
+
+	//
+	// Serialize the whole lookup-and-publish window against ntdll's loader.
+	//
+	// Two things below require it. The duplicate-module scan walks
+	// PEB->Ldr->InLoadOrderModuleList, a list ntdll only ever mutates under this
+	// lock, so an unlocked walk can observe it mid-splice while any other thread
+	// loads a DLL. And the scan is a check-then-act: without holding the lock
+	// across the map and the LdrMapDllMemory() publish, two threads loading the
+	// same image can both miss and both map it, producing two loader entries for
+	// one module and a doubled DllMain.
+	//
+	// The lock is dropped again before the module's own entry points run; see
+	// the Release() calls below.
+	//
+	MmpLoaderLockGuard loaderLock;
 
 	if (dwFlags & LOAD_FLAGS_NOT_MAP_DLL) {
 		dwFlags &= LOAD_FLAGS_NOT_MAP_DLL;
@@ -147,6 +185,14 @@ NTSTATUS NTAPI LdrLoadDllMemoryExW(
 			status = MemorySetSectionProtection(LPBYTE(*BaseAddress), headers);
 			if (!NT_SUCCESS(status))break;
 
+			//
+			// Run the module's TLS callbacks and DllMain without the loader lock,
+			// as they were run before the lock was introduced. Holding it here
+			// would let a DllMain that waits on another thread deadlock the
+			// process against that thread's DLL_THREAD_ATTACH.
+			//
+			loaderLock.Release();
+
 			if (!LdrpExecuteTLS(module) || !LdrpCallInitializers(module, DLL_PROCESS_ATTACH)) {
 				status = STATUS_DLL_INIT_FAILED;
 				break;
@@ -155,6 +201,12 @@ NTSTATUS NTAPI LdrLoadDllMemoryExW(
 		} while (false);
 
 		if (!NT_SUCCESS(status)) {
+			//
+			// Retake the lock for the cleanup. MemoryFreeLibrary() enters the IAT
+			// resolver lock and calls FreeLibrary() under it, so it has to run in
+			// the same loader-lock-then-resolver-lock order as everywhere else.
+			//
+			MmpLoaderLockGuard cleanupLock;
 			MemoryFreeLibrary(*BaseAddress);
 		}
 
@@ -195,12 +247,28 @@ NTSTATUS NTAPI LdrLoadDllMemoryExW(
 			}
 		}
 
+		//
+		// Everything that touches ntdll's shared structures is done; the module
+		// is mapped and published. Drop the lock so the module's TLS callbacks
+		// and DllMain run exactly as they did before the lock was introduced.
+		// Holding it across DllMain would deadlock any module whose DllMain
+		// waits on another thread, since that thread's DLL_THREAD_ATTACH needs
+		// the same lock.
+		//
+		loaderLock.Release();
+
 		if (!LdrpExecuteTLS(module) || !LdrpCallInitializers(module, DLL_PROCESS_ATTACH)) {
 			status = STATUS_DLL_INIT_FAILED;
 			break;
 		}
 
 	} while (false);
+
+	//
+	// Released either at the Release() above or here, before the failure path
+	// re-enters LdrUnloadDllMemory (which takes the lock itself).
+	//
+	loaderLock.Release();
 
 	if (NT_SUCCESS(status)) {
 		if (LdrEntry)*LdrEntry = ModuleEntry;
@@ -219,6 +287,14 @@ NTSTATUS NTAPI LdrUnloadDllMemory(_In_ HMEMORYMODULE BaseAddress) {
 	NTSTATUS status = STATUS_SUCCESS;
 	PMEMORYMODULE module = MapMemoryModuleHandle(BaseAddress);
 	PIMAGE_NT_HEADERS headers = RtlImageNtHeader(BaseAddress);
+
+	//
+	// Mirror of the load path: hold the loader lock across the reference count
+	// decision so two threads cannot both conclude they are the last reference
+	// and tear the module down twice, then drop it to run DLL_PROCESS_DETACH,
+	// then retake it for the structural teardown.
+	//
+	MmpLoaderLockGuard loaderLock;
 
 	do {
 
@@ -254,7 +330,18 @@ NTSTATUS NTAPI LdrUnloadDllMemory(_In_ HMEMORYMODULE BaseAddress) {
 			break;
 		}
 
+		//
+		// underUnload is published before the lock is dropped, so a concurrent
+		// unload of the same module sees the teardown already in progress.
+		//
 		module->underUnload = true;
+
+		//
+		// DLL_PROCESS_DETACH is module code, so run it outside the lock for the
+		// same reason DLL_PROCESS_ATTACH is run outside it in the load path.
+		//
+		loaderLock.Release();
+
 		if (module->initialized) {
 			PLDR_INIT_ROUTINE((LPVOID)(module->codeBase + headers->OptionalHeader.AddressOfEntryPoint))(
 				(HINSTANCE)module->codeBase,
@@ -262,6 +349,12 @@ NTSTATUS NTAPI LdrUnloadDllMemory(_In_ HMEMORYMODULE BaseAddress) {
 				0
 				);
 		}
+
+		//
+		// Retake it for the teardown: unlinking the loader entry and removing the
+		// inverted function table entry both mutate ntdll's shared structures.
+		//
+		MmpLoaderLockGuard teardownLock;
 
 		if (module->MappedDll) {
 			if (module->InsertInvertedFunctionTableEntry) {
