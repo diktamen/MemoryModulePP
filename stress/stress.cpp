@@ -510,6 +510,18 @@ int main(int argc, char** argv) {
     printf("  ping failures     : %lld\n", g_pingFailures.load());
     printf("  integrity failures: %lld\n", g_integrityFailures.load());
 
+    //
+    // Read the loader lock failure counter out of the DLL under test. Anything
+    // but zero means it spliced ntdll's module lists without the loader lock
+    // held, which would explain list corruption directly and rule everything
+    // else out.
+    //
+    {
+        auto failures = (volatile LONG*)GetProcAddress(mm, "MmpLoaderLockAcquireFailures");
+        if (failures) printf("  loaderlock acq failures: %ld\n", *failures);
+        else printf("  loaderlock acq failures: (not exported)\n");
+    }
+
     long long bad = g_loadFailures.load() + g_unloadFailures.load() +
         g_pingFailures.load() + g_integrityFailures.load();
 

@@ -13,15 +13,34 @@
 // Acquisition is best effort: if the lock cannot be taken, Held stays false
 // and the caller proceeds unserialized rather than failing the load.
 //
+//
+// Counts loader lock acquisitions that did not succeed. Exported so the stress
+// harness can tell "we mutated ntdll's lists unlocked" apart from every other
+// explanation for list corruption. Should be zero.
+//
+extern "C" __declspec(dllexport) volatile LONG MmpLoaderLockAcquireFailures;
+
 struct MmpLoaderLockGuard {
 	PVOID Cookie = nullptr;
 	bool Held = false;
 
+	//
+	// Acquisition must not silently fall through to unserialized access: the
+	// caller is about to splice ntdll's module lists, and doing that without the
+	// lock is exactly what corrupts them. Retry until the lock is genuinely
+	// held, the way ntdll's own callers do.
+	//
 	MmpLoaderLockGuard() {
-		ULONG disposition = LDR_LOCK_LOADER_LOCK_DISPOSITION_INVALID;
-		if (NT_SUCCESS(LdrLockLoaderLock(0, &disposition, &Cookie)) &&
-			disposition == LDR_LOCK_LOADER_LOCK_DISPOSITION_LOCK_ACQUIRED) {
-			Held = true;
+		for (ULONG attempt = 0; attempt < 64 && !Held; ++attempt) {
+			ULONG disposition = LDR_LOCK_LOADER_LOCK_DISPOSITION_INVALID;
+			Cookie = nullptr;
+			if (NT_SUCCESS(LdrLockLoaderLock(0, &disposition, &Cookie)) &&
+				disposition == LDR_LOCK_LOADER_LOCK_DISPOSITION_LOCK_ACQUIRED) {
+				Held = true;
+			}
+			else {
+				MmpLoaderLockAcquireFailures++;
+			}
 		}
 	}
 	~MmpLoaderLockGuard() { Release(); }

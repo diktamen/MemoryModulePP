@@ -22,11 +22,12 @@ are correspondingly optimistic.
 **Where it stands, measured on arm64** with real sample sizes:
 
 ```
- 8 loaders +  8 noise, 200it, 16 runs    9/16 pass   4 fast-fail  3 soft
-24 loaders + 12 noise, 200it, 12 runs    6/12 pass   2 fast-fail  4 soft
+ 8 loaders +  8 noise, 200it, 20 runs   15/20 pass   2 fast-fail  3 soft
+24 loaders + 12 noise, 200it, 12 runs    2-6/12 pass  highly variable at this load
 ```
 
-So about half of runs fail. The same configuration on emulated x64 was 7/8,
+So roughly a quarter of runs fail at 8+8, and about half at 24+12. The same
+8+8 configuration on emulated x64 read 7/8,
 which is the sampling trap again in a new guise: the slower environment simply
 does not generate enough contention to expose the rate.
 
@@ -61,12 +62,46 @@ of MemoryModulePP's own `__fastfail` calls. It means a list in ntdll's loader
 database is inconsistent, and since the only foreign entries in those lists are
 the ones we fabricate, we are still corrupting something.
 
-Partly localised: not inserting into `LdrpHashTable` cuts the rate roughly in
-half, so that insert is one source but not the only one. What remains is most
-likely elsewhere in the fabricated `LDR_DATA_TABLE_ENTRY` -- the `DdagNode` and
-its `Modules`/dependency lists are the obvious suspects, since
-`RtlFreeLdrDataTableEntry` dismantles them and can re-enter ntdll through
-`LdrUnloadDll` while our entry is still linked.
+### What ntdll is actually checking
+
+Disassembled (`uf ntdll!LdrpInsertDataTableEntry`, public symbols), the function
+is short and entirely legible. In order:
+
+1. `ldr w8,[x2,#0x68]` then `tbnz x8,#6` -- **if `InLegacyLists` is already set
+   it returns immediately.** We set that flag, so ntdll never inserts our
+   entries. Useful to know: our entries are inert to this function.
+2. If `BaseNameHashValue` (`+0x108`) is zero it calls `LdrpHashUnicodeString`,
+   otherwise it **trusts the stored value**. Bucket is `hash & 0x1F`.
+3. Three guarded `InsertTailList` operations, all branching to one
+   `brk #0xF003` (`FAST_FAIL_CORRUPT_LIST_ENTRY`) at `+0x50`:
+   - the `LdrpHashTable` bucket
+   - `InLoadOrderModuleList` (`PEB->Ldr+0x10`, `Blink` at `+0x18`)
+   - `InMemoryOrderModuleList` (`PEB->Ldr+0x20`, `Blink` at `+0x28`)
+
+The invariant in every case is the standard one: **`head->Blink->Flink == head`**.
+So ntdll is telling us the tail linkage of one of those lists is wrong at the
+moment it tries to append. Since a single `brk` serves all three, the ARM64
+offset does not say which; the x64 build faulted at `+0x12c`, deeper in its
+version of the function, which suggests one of the two module lists rather than
+the hash bucket.
+
+That reframes the search. We still insert into and remove from both module
+lists, and those edits are provably under the loader lock, so the leading
+hypothesis is now that one of our entries is still reachable as a list tail at a
+moment when it should not be -- freed, or unlinked incompletely -- rather than
+that any individual splice races.
+
+Eliminated so far, each with a measurement or a symbol dump behind it:
+
+| Hypothesis | How it was ruled out |
+| --- | --- |
+| We mutate the lists without the loader lock | `MmpLoaderLockAcquireFailures` is exported and reads 0 over thousands of loads |
+| Native loader cannot take this traffic | 72,094 native load/unload ops across 24 threads, zero failures |
+| Our `LDR_DATA_TABLE_ENTRY` layout is stale for this build | `dt ntdll!_LDR_DATA_TABLE_ENTRY` matches ours field for field to `HotPatchState` at `+0x130` |
+| Our `LDR_DDAG_NODE` layout is wrong | `dt ntdll!_LDR_DDAG_NODE` matches ours field for field |
+| Claiming `InIndexes` while only being in one of two index trees | cleared it; 4/12 against 5/12, no effect |
+| `LdrpHashTable` insert | removing it roughly halved the rate, so it was *a* source but not the only one |
+| Freeing `DdagNode` before unlinking the entry | fixed; 9/16 to 27/32 at 8+8 |
 
 Worth noting for anyone reading x64 stacks on this host: they carry `ARM64EC`
 frames and `CpuSetInSyscallCallback`-style artifacts, because the x64 harness is

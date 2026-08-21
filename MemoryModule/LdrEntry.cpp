@@ -223,9 +223,37 @@ BOOL NTAPI RtlFreeLdrDataTableEntry(_In_ PLDR_DATA_TABLE_ENTRY LdrEntry) {
 	case WINDOWS_VERSION::win8:
 	case WINDOWS_VERSION::winBlue: {
 		auto entry = (PLDR_DATA_TABLE_ENTRY_WIN10)LdrEntry;
+
+		//
+		// Make the entry unreachable before dismantling anything it points at.
+		//
+		// This used to free the DdagNode first and unlink the entry afterwards,
+		// in the fall-through below. That left a window in which the entry was
+		// still linked into all three of ntdll's module lists while its DdagNode
+		// pointer was already dangling, and ntdll's loader walks those lists and
+		// dereferences DdagNode. Once the freed block was reused, ntdll followed
+		// whatever now lived there, which is how it ended up raising
+		// FAST_FAIL_CORRUPT_LIST_ENTRY from inside LdrpInsertDataTableEntry on an
+		// unrelated thread doing an ordinary LoadLibrary.
+		//
+		// Unlink first, then take the entry out of the base address index, and
+		// only then release what it owns. The links are reset to self-referential
+		// so that the RemoveEntryList calls in the fall-through case below are
+		// harmless no-ops rather than a second unlink that would corrupt the
+		// neighbours we already spliced out.
+		//
+		RemoveEntryList(&LdrEntry->InLoadOrderLinks);
+		RemoveEntryList(&LdrEntry->InMemoryOrderLinks);
+		RemoveEntryList(&LdrEntry->InInitializationOrderLinks);
+		InitializeListHead(&LdrEntry->InLoadOrderLinks);
+		InitializeListHead(&LdrEntry->InMemoryOrderLinks);
+		InitializeListHead(&LdrEntry->InInitializationOrderLinks);
+
+		RtlRemoveModuleBaseAddressIndexNode(LdrEntry);
+
 		RtlFreeDependencies(entry);
 		RtlFreeHeap(heap, 0, entry->DdagNode);
-		RtlRemoveModuleBaseAddressIndexNode(LdrEntry);
+		entry->DdagNode = nullptr;
 	}
 	case WINDOWS_VERSION::win7:
 	case WINDOWS_VERSION::vista: {

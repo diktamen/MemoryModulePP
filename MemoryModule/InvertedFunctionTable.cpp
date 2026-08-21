@@ -298,3 +298,8 @@ NTSTATUS NTAPI MmpUnregisterExceptionTable(_In_ PVOID BaseAddress) {
 	return RtlRemoveInvertedFunctionTable(BaseAddress);
 #endif
 }
+
+//
+// Definition for the counter declared in LoaderPrivate.h.
+//
+extern "C" volatile LONG MmpLoaderLockAcquireFailures = 0;
