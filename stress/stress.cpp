@@ -53,6 +53,13 @@
 //
 static bool g_skipInvertedTable = false;
 
+//
+// Set by --force-seh. Uses the exception-raising probe even under --no-ift, to
+// test whether x64 exception dispatch into a memory module works without an
+// LdrpInvertedFunctionTable entry at all.
+//
+static bool g_forceSeh = false;
+
 typedef HMODULE(WINAPI* PFN_LoadLibraryMemoryExW)(PVOID, size_t, LPCWSTR, LPCWSTR, DWORD);
 typedef BOOL(WINAPI* PFN_FreeLibraryMemory)(HMODULE);
 typedef int(*PFN_StressPing)(int);
@@ -225,7 +232,7 @@ static void LoaderThread(int index, PVOID image, bool distinctNames, int iterati
     DWORD flags = LOAD_FLAGS_USE_DLL_NAME | LOAD_FLAGS_NOT_FAIL_IF_HANDLE_TLS;
     if (g_skipInvertedTable) flags |= LOAD_FLAGS_NOT_ADD_INVERTED_FUNCTION;
 
-    const char* pingExport = g_skipInvertedTable ? "StressPingNoSeh" : "StressPing";
+    const char* pingExport = (g_skipInvertedTable && !g_forceSeh) ? "StressPingNoSeh" : "StressPing";
 
     for (int i = 0; i < iterations && !g_stop.load(); ++i) {
         if (coin(rng) == 0) Sleep(longSleep(rng)); else Sleep(shortSleep(rng));
@@ -372,6 +379,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--iters")) iters = atoi(next("--iters"));
         else if (!strcmp(argv[i], "--seconds")) noiseSeconds = atoi(next("--seconds"));
         else if (!strcmp(argv[i], "--no-ift")) g_skipInvertedTable = true;
+        else if (!strcmp(argv[i], "--force-seh")) g_forceSeh = true;
         else { Usage(); return 2; }
     }
 

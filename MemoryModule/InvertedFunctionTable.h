@@ -58,3 +58,17 @@ NTSTATUS NTAPI RtlInsertInvertedFunctionTable(
 );
 
 NTSTATUS NTAPI RtlRemoveInvertedFunctionTable(_In_ PVOID ImageBase);
+
+//
+// Make a memory module's unwind info visible to RtlLookupFunctionEntry, and undo
+// it. On x64 these use ntdll's documented dynamic function table
+// (RtlAddFunctionTable/RtlDeleteFunctionTable), which ntdll serializes itself.
+// On x86 there is no such API and they fall back to editing
+// LdrpInvertedFunctionTable directly.
+//
+NTSTATUS NTAPI MmpRegisterExceptionTable(
+	_In_ PVOID BaseAddress,
+	_In_ ULONG ImageSize
+);
+
+NTSTATUS NTAPI MmpUnregisterExceptionTable(_In_ PVOID BaseAddress);

@@ -147,6 +147,15 @@ NTSTATUS NTAPI LdrLoadDllMemoryExW(
 				/* Let's compare their headers */
 				if (!(h2 = RtlImageNtHeader(CurEntry->DllBase)))continue;
 				if (!(module = MapMemoryModuleHandle((HMEMORYMODULE)CurEntry->DllBase)))continue;
+
+				//
+				// Skip a module that is already being torn down. Its loader entry
+				// stays linked while DLL_PROCESS_DETACH runs outside the lock, so
+				// without this check we would take a reference on it and hand back
+				// a handle that the unloading thread is about to free.
+				//
+				if (module->underUnload)continue;
+
 				if ((h1->OptionalHeader.SizeOfCode == h2->OptionalHeader.SizeOfCode) &&
 					(h1->OptionalHeader.SizeOfHeaders == h2->OptionalHeader.SizeOfHeaders)) {
 				
@@ -230,7 +239,7 @@ NTSTATUS NTAPI LdrLoadDllMemoryExW(
 		if (!(dwFlags & LOAD_FLAGS_NOT_USE_REFERENCE_COUNT))module->UseReferenceCount = true;
 
 		if (!(dwFlags & LOAD_FLAGS_NOT_ADD_INVERTED_FUNCTION)) {
-			status = RtlInsertInvertedFunctionTable((PVOID)module->codeBase, headers->OptionalHeader.SizeOfImage);
+			status = MmpRegisterExceptionTable((PVOID)module->codeBase, headers->OptionalHeader.SizeOfImage);
 			if (!NT_SUCCESS(status)) break;
 
 			module->InsertInvertedFunctionTableEntry = true;
@@ -285,8 +294,6 @@ NTSTATUS NTAPI LdrUnloadDllMemory(_In_ HMEMORYMODULE BaseAddress) {
 	PLDR_DATA_TABLE_ENTRY CurEntry;
 	ULONG count = 0;
 	NTSTATUS status = STATUS_SUCCESS;
-	PMEMORYMODULE module = MapMemoryModuleHandle(BaseAddress);
-	PIMAGE_NT_HEADERS headers = RtlImageNtHeader(BaseAddress);
 
 	//
 	// Mirror of the load path: hold the loader lock across the reference count
@@ -294,7 +301,15 @@ NTSTATUS NTAPI LdrUnloadDllMemory(_In_ HMEMORYMODULE BaseAddress) {
 	// and tear the module down twice, then drop it to run DLL_PROCESS_DETACH,
 	// then retake it for the structural teardown.
 	//
+	// The lock is taken before the handle is resolved, not after. MapMemoryModuleHandle()
+	// and RtlImageNtHeader() both read the image, and if another thread completed
+	// the final unload first, that memory is already released -- reading it
+	// outside the lock is a use after free.
+	//
 	MmpLoaderLockGuard loaderLock;
+
+	PMEMORYMODULE module = MapMemoryModuleHandle(BaseAddress);
+	PIMAGE_NT_HEADERS headers = RtlImageNtHeader(BaseAddress);
 
 	do {
 
@@ -358,7 +373,7 @@ NTSTATUS NTAPI LdrUnloadDllMemory(_In_ HMEMORYMODULE BaseAddress) {
 
 		if (module->MappedDll) {
 			if (module->InsertInvertedFunctionTableEntry) {
-				status = RtlRemoveInvertedFunctionTable(BaseAddress);
+				status = MmpUnregisterExceptionTable(BaseAddress);
 				if (!NT_SUCCESS(status)) __fastfail(FAST_FAIL_CORRUPT_LIST_ENTRY);
 			}
 

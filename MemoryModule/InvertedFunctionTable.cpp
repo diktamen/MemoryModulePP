@@ -225,3 +225,76 @@ NTSTATUS NTAPI RtlRemoveInvertedFunctionTable(_In_ PVOID ImageBase) {
 
 	return STATUS_SUCCESS;
 }
+
+//
+// LdrpInvertedFunctionTable is a fixed-size array inside ntdll's .mrdata, and
+// reaching it requires flipping that shared page writable and back with
+// RtlProtectMrdata(). ntdll flips the same page for its own inserts and
+// serializes that on a lock we cannot take, so our flip races its flip no matter
+// what we hold: we either write to a page ntdll just made read-only, or make it
+// read-only under ntdll's own write. Both were reproducible under
+// stress/stress.cpp as a crash in the RtlMoveMemory() shift or as a loader-wide
+// hang, identically with and without the loader lock.
+//
+// x64 has a documented way to do this that does not touch ntdll's internals at
+// all: RtlAddFunctionTable() publishes unwind info in ntdll's dynamic function
+// table, which RtlLookupFunctionEntry() consults for addresses that are not in
+// the inverted table, and which ntdll guards with its own lock. This is what
+// JITs use for generated code. It also has no fixed capacity, so it drops the
+// hard ceiling on concurrently loaded memory modules that the inverted table
+// imposes.
+//
+// x86 has no equivalent API, so it keeps the old path. That platform is not
+// built for shipping here and is left as it was rather than changed untested.
+//
+NTSTATUS NTAPI MmpRegisterExceptionTable(
+	_In_ PVOID BaseAddress,
+	_In_ ULONG ImageSize) {
+#ifdef _WIN64
+	UNREFERENCED_PARAMETER(ImageSize);
+
+	ULONG DirectorySize = 0;
+	auto FunctionTable = (PRUNTIME_FUNCTION)RtlImageDirectoryEntryToData(
+		BaseAddress, TRUE, IMAGE_DIRECTORY_ENTRY_EXCEPTION, &DirectorySize);
+
+	//
+	// No exception directory means nothing to publish. That is not a failure: a
+	// module with no unwind info needs no registration.
+	//
+	if (!FunctionTable || !DirectorySize) return STATUS_SUCCESS;
+
+	if (DirectorySize % sizeof(RUNTIME_FUNCTION)) return STATUS_INVALID_IMAGE_FORMAT;
+
+	//
+	// The entries live in the mapped image's .pdata and stay valid until unload,
+	// which is exactly the lifetime RtlAddFunctionTable requires.
+	//
+	return RtlAddFunctionTable(FunctionTable,
+		DirectorySize / sizeof(RUNTIME_FUNCTION),
+		(DWORD64)BaseAddress) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+#else
+	return RtlInsertInvertedFunctionTable(BaseAddress, ImageSize);
+#endif
+}
+
+NTSTATUS NTAPI MmpUnregisterExceptionTable(_In_ PVOID BaseAddress) {
+#ifdef _WIN64
+	ULONG DirectorySize = 0;
+	auto FunctionTable = (PRUNTIME_FUNCTION)RtlImageDirectoryEntryToData(
+		BaseAddress, TRUE, IMAGE_DIRECTORY_ENTRY_EXCEPTION, &DirectorySize);
+
+	//
+	// Mirrors the registration side: nothing was published for an image without
+	// an exception directory, so there is nothing to remove.
+	//
+	if (!FunctionTable || !DirectorySize) return STATUS_SUCCESS;
+
+	//
+	// RtlDeleteFunctionTable takes the same pointer that was registered, which we
+	// recompute from the still-mapped image rather than caching it.
+	//
+	return RtlDeleteFunctionTable(FunctionTable) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+#else
+	return RtlRemoveInvertedFunctionTable(BaseAddress);
+#endif
+}
