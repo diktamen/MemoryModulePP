@@ -179,25 +179,57 @@ failures. It survives the lock fix untouched and is the only reason a run still
 reports `FAIL` on a healthy build. **When triaging, separate exit `1` with a lone
 ping failure from exit `0xC0000409`; they are different bugs.**
 
-**It is ours, and that is now measured rather than assumed.** `stress/nativetls.cpp`
-is the control: it loads the *same* payload with plain `LoadLibraryW`, never
-touches MemoryModulePP — it refuses to run if a MemoryModule DLL is in the
-process — and hammers the same two exports. Three phases, because a dynamically
-loaded DLL with implicit TLS has more than one interesting case: `steady` (load,
-then create threads), `retrofit` (create threads, *then* load, so the loader has
-to fit TLS to threads that already exist — the job `MmpHandleTlsData`
-reimplements), and `churn` (ping while other threads load and free the same
-module).
+### On two of three configurations there is no TLS handling at all
 
-| Configuration | pings | wrong | expected if it were an OS/CRT bug |
-| --- | --- | --- | --- |
-| native ARM64 | 1,920,000 | **0** | ~1,200 |
-| x64 under ARM64X | 576,000 | **0** | ~45 |
-| genuine x64 (Server 2022) | 1,080,000 | **0** | ~84 |
+**This is the important finding, and it invalidates most of what was assumed
+here.** `LdrQuerySystemMemoryModuleFeatures` now gets printed on every run:
 
-So the ordinary loader does not reproduce it at ~3.5M pings, including the
-retrofit phase. Windows, the CRT, the payload and the test are all cleared;
-`MmpLdrpTls.cpp` is the right place to look.
+| Configuration | features | `MEMORY_FEATURE_LDRP_HANDLE_TLS_DATA` |
+| --- | --- | --- |
+| native ARM64 | `0x5F` | **OFF** |
+| x64 under ARM64X | `0x5F` | **OFF** |
+| genuine x64 (Server 2022) | `0x7F` | ON |
+
+`RtlFindLdrpHandleTlsData10` locates the function by scanning `.text` for the
+literal bytes `48 8D 15` — `lea rdx,[rip+disp32]`. That encoding does not exist
+on ARM64, so the scan finds nothing, `MmpTlsInitialize()` nulls both TLS
+pointers and clears the feature bit, and `Loader.cpp` then fails the load
+*unless* the caller passes `LOAD_FLAGS_NOT_FAIL_IF_HANDLE_TLS` — which the
+harness does. So on ARM64 every memory-loaded module has been running with **no
+TLS set up whatsoever**, and the payload's `thread_local` resolves through an
+unallocated index. Runs still report `PASS`.
+
+Consequences for this issue:
+
+- **The ~1/1,600 ARM64 rate is not a defect in `MmpHandleTlsData`, because
+  `MmpHandleTlsData` never ran.** It is what an unallocated TLS index does. That
+  it mostly *works* is luck: the fallback slot is still per-thread, so a
+  write-then-read round-trips within one thread most of the time.
+- **Genuine x64 is the only configuration where this issue can be about
+  MemoryModulePP's TLS handling at all.** Any A/B run on ARM64 — including the
+  first two run here — measures nothing about it.
+- On genuine x64 the legacy scan resolves to **exactly** the address
+  `stress/probe_tls_handle.cpp` verifies behaviourally, so a wrong address is
+  *ruled out* as the cause of the 1/12,800 x64 rate.
+
+### The controls, and what each is actually worth
+
+`stress/nativetls.cpp` loads the same payload with plain `LoadLibraryW` and never
+touches MemoryModulePP. Three phases: `steady`, `retrofit` (threads created
+*before* the load, so TLS must be fitted to them afterwards) and `churn`. Result:
+0 wrong in ~3.5M pings across all three configurations.
+
+**That is weaker evidence than it looks, and an earlier revision of this file
+oversold it.** It hammers pings at a module that is *already loaded*, whereas the
+harness pings once per *fresh load*. If the defect is in TLS setup at load time,
+this barely probes it. It rules out a steady-state OS/CRT bug and nothing more.
+
+`stress --native` is the honest control: identical workload, identical thread and
+iteration counts, identical timing and interleave points, with only the loader
+swapped, and MemoryModulePP still loaded so exactly one variable differs. First
+run, 6 rounds per arm on ARM64: 14,400 loads each side, **0 ping failures on
+both** — but see above, that configuration has TLS handling off, so it was again
+measuring the wrong thing. The meaningful run is on genuine x64.
 
 Suspects, in order: `MmpLdrpTls.cpp` locating ntdll's `LdrpHandleTlsData` by a
 multi-stage code-and-data pattern scan (see issue 6); the ordering between
@@ -244,7 +276,7 @@ rest of the ntdll internals this library depends on are not:
 
 | Target | How it is found | Risk |
 | --- | --- | --- |
-| `LdrpHandleTlsData` | multi-stage pattern scan over `.rdata`/`.text`, plus hardcoded prologue offsets for 6.1/6.2/6.3 | high; x86 unsupported; Win11 uses the Win10 signature because it reports major version 10 |
+| `LdrpHandleTlsData` | multi-stage pattern scan over `.rdata`/`.text`, plus hardcoded prologue offsets for 6.1/6.2/6.3 | **confirmed broken on ARM64 and ARM64X — see below**; x86 unsupported; Win11 uses the Win10 signature because it reports major version 10 |
 | `LdrpReleaseTlsEntry` | a single hardcoded 21-byte signature, x64 Windows 10 only | high |
 | `LdrpInvertedFunctionTable` | byte-pattern scan with hardcoded struct offsets and a hardcoded `MaxCount` of `0x200` | low on x64: since issue 8, no live caller remains there. x86 still reaches it through `MmpRegisterExceptionTable`'s fallback |
 | `LdrpModuleBaseAddressIndex` | structural derivation, then an address-value scan of `.data` | medium, plus issue 7 |
@@ -253,7 +285,46 @@ rest of the ntdll internals this library depends on are not:
 If either TLS scan misses, **both** pointers are nulled, the feature bit is
 cleared after having been set, `MmpTlsInitialize()`'s failure return is discarded
 by the caller, and loads then fail unless the caller passes
-`LOAD_FLAGS_NOT_HANDLE_TLS`. That is a lot of silent degradation.
+`LOAD_FLAGS_NOT_HANDLE_TLS`. That is a lot of silent degradation — and it is not
+hypothetical: it is happening today on two of three configurations (issue 4).
+
+### `LdrpHandleTlsData`: measured, and a warning about fixing it
+
+`stress/probe_tls_handle.cpp` locates it without byte signatures: find the
+`"LdrpHandleTlsData"` string in `.rdata`, find the xref to it accepting *any*
+destination register on x64 and `adrp`+`add` on ARM64, identify the containing
+funclet through the exported `RtlLookupFunctionEntry`, then recover the parent
+function two independent ways — from the validated scope record in `.rdata`, and
+by walking the unwind tables — and require both to agree. Corroborated by finding
+`LdrpTlsList` structurally, and proved behaviourally: hand the candidate a
+fabricated image with a TLS directory and require a real TLS index to come back,
+`LdrpTlsList` to grow by one, this thread's TLS vector to hold the template
+bytes, and a second module to get index+1.
+
+| | native ARM64 | x64 under ARM64X | genuine x64 |
+| --- | --- | --- | --- |
+| located | `ntdll+0xD2270` | `ntdll+0x218700` (ARM64EC) | `ntdll+0x35BF0` |
+| anchors agreeing | 2 of 2 | 2 of 2 | 2 of 2 |
+| behavioural proof | PASS | not possible | PASS |
+| the library's scan | **fails at stage 2** | **fails at stage 2** | agrees exactly |
+
+Cross-checked against `ntdll.pdb` on the ARM64X box: `LdrpHandleTlsData`
+`0xD2270`, `#LdrpHandleTlsData` `0x218700`, `LdrpTlsList` `0x3887E0` — all three
+match. The probe itself never uses symbols.
+
+**Do not simply fix the locator on x64-under-ARM64X.** ntdll's loader is compiled
+twice there, and the copy an x64 process can reach is ARM64EC. Exported functions
+carry an entry thunk (the 4 bytes before the entry point, tagged 1 in the low
+bits); `LdrpHandleTlsData` is internal and has none. Calling it directly from x64
+kills the process with `STATUS_WX86_INTERNAL_ERROR` (`0xC000026F`) — **not a
+catchable exception, no first-chance dispatch**. The current build escapes this
+only because its scan finds nothing. A better locator without an
+architecture-callability gate would convert a silent no-op into an undiagnosable
+process kill. Any fix must refuse the call when the candidate is in an ARM64EC
+range with no entry thunk.
+
+Also measured: the string `"LdrpReleaseTlsEntry"` does not exist in ntdll on
+either build, so this technique does not transfer to that function.
 
 ---
 

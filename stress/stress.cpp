@@ -238,7 +238,41 @@ int main(int argc, char** argv) {
     printf("  payload  : %s (%zu bytes)\n", payloadPath, imageSize);
     printf("  mode     : %s\n", mode.c_str());
     printf("  threads  : %d loader, %d noise\n", threads, noise);
-    printf("  iters    : %d per loader thread\n\n", iters);
+    printf("  iters    : %d per loader thread\n", iters);
+
+    //
+    // Which capabilities actually came up. This is not decoration: the TLS
+    // locator is an x64-only byte scan, so on ARM64 it finds nothing,
+    // MmpTlsInitialize nulls both TLS pointers and clears this bit, and the load
+    // then succeeds anyway because the loader threads pass
+    // LOAD_FLAGS_NOT_FAIL_IF_HANDLE_TLS. The payload's thread_local resolves
+    // through an unallocated index and the run still reports PASS.
+    //
+    // So a ping-failure count is only interpretable next to this line. Comparing
+    // arms while TLS handling is off on one of them measures nothing.
+    //
+    DWORD features = 0;
+    {
+        auto q = (PFN_LdrQueryFeatures)GetProcAddress(mm, "LdrQuerySystemMemoryModuleFeatures");
+        if (q && q(&features) >= 0) {
+            printf("  features : 0x%02lX  tls-handle=%s tls-release=%s base-index=%s hash=%s ift=%s\n",
+                features,
+                (features & MEMORY_FEATURE_LDRP_HANDLE_TLS_DATA) ? "ON" : "OFF",
+                (features & MEMORY_FEATURE_LDRP_RELEASE_TLS_ENTRY) ? "ON" : "OFF",
+                (features & MEMORY_FEATURE_MODULE_BASEADDRESS_INDEX) ? "ON" : "OFF",
+                (features & MEMORY_FEATURE_LDRP_HASH_TABLE) ? "ON" : "OFF",
+                (features & MEMORY_FEATURE_INVERTED_FUNCTION_TABLE) ? "ON" : "OFF");
+            if (!g_native && !(features & MEMORY_FEATURE_LDRP_HANDLE_TLS_DATA)) {
+                printf("  WARNING  : TLS handling is OFF -- memory-loaded modules get no TLS\n"
+                       "             setup at all, so ping results say nothing about\n"
+                       "             MmpHandleTlsData on this build.\n");
+            }
+        }
+        else {
+            printf("  features : (LdrQuerySystemMemoryModuleFeatures unavailable)\n");
+        }
+    }
+    printf("\n");
 
     std::string detail;
     if (!CheckLoaderIntegrity(detail)) {
