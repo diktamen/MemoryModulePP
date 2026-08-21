@@ -115,9 +115,15 @@ if errorlevel 1 (
 )
 
 echo === building stress harness ===
+rem
+rem Several translation units now: stress.cpp is options and orchestration,
+rem workload.cpp the loader and noise threads, bench.cpp the shared state,
+rem payload IO, integrity checking and crash reporting. /Fo takes a directory
+rem here rather than a file name, which it needs when given more than one source.
+rem
 cl /nologo /std:c++17 /O2 /MT /EHsc ^
-    /Fo"%OUT%\stress.obj" /Fd"%OUT%\stress.pdb" ^
-    "%~dp0stress.cpp" ^
+    /Fo%OUT%\ /Fd"%OUT%\stress.pdb" ^
+    "%~dp0stress.cpp" "%~dp0workload.cpp" "%~dp0bench.cpp" ^
     /link /OUT:"%OUT%\stress.exe"
 if errorlevel 1 (
     echo error: stress harness build failed.
