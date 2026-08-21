@@ -349,3 +349,4 @@ stress/bin/
 stress/bin-prepatch/
 
 stress/bin-basehash/
+stress/bin-arm64/

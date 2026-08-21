@@ -9,34 +9,69 @@ rem Run from a Developer Command Prompt, or let this find MSVC via vswhere.
 rem
 setlocal enabledelayedexpansion
 
+rem
+rem Optional first argument selects the target architecture: x64 (default) or
+rem arm64. Each lands in its own output directory so both can coexist. The
+rem diagnostic variant names are shared, because gflags keys Image File
+rem Execution Options on the file name only, not the architecture.
+rem
+rem This host is ARM64, so arm64 builds natively (vcvarsarm64) and x64 builds
+rem run under emulation. Testing arm64 removes the emulation layer from the
+rem picture entirely, which matters when reading loader stacks.
+rem
+set ARCH=%~1
+if "%ARCH%"=="" set ARCH=x64
+
+if /i "%ARCH%"=="x64" (
+    set TGT_ARCH=x64
+    set MSBUILD_PLATFORM=x64
+    set VCVARS=vcvars64.bat
+    set MACHINE_TAG=8664 machine ^(x64^)
+    set BINSUFFIX=
+    set MMDLL=MemoryModule64.dll
+) else (
+    if /i "%ARCH%"=="arm64" (
+        set TGT_ARCH=arm64
+        set MSBUILD_PLATFORM=ARM64
+        set VCVARS=vcvarsarm64.bat
+        set MACHINE_TAG=AA64 machine ^(ARM64^)
+        set BINSUFFIX=-arm64
+        set MMDLL=MemoryModulearm.dll
+    ) else (
+        echo error: unknown architecture "%ARCH%"^; use x64 or arm64.
+        exit /b 1
+    )
+)
+
 set ROOT=%~dp0..
-set OUT=%~dp0bin
+set OUT=%~dp0bin%BINSUFFIX%
 
 rem
-rem Insist on an x64 target. Testing VCINSTALLDIR is not enough: an ambient
-rem developer environment targeting x86 leaves it set, cl then quietly emits x86,
-rem and the harness fails at runtime with error 193 loading the x64 DLL.
+rem Insist on the requested target. Testing VCINSTALLDIR is not enough: an
+rem ambient developer environment targeting something else leaves it set, cl then
+rem quietly emits for that target, and the harness fails at runtime with error
+rem 193 loading a DLL of the wrong architecture.
 rem
 rem Note: the quoted "set VAR=..." form is required here. %ProgramFiles(x86)%
 rem contains parentheses, which terminate an if-block early if left unquoted.
 rem
-if not "%VSCMD_ARG_TGT_ARCH%"=="x64" (
+if not "%VSCMD_ARG_TGT_ARCH%"=="%TGT_ARCH%" (
     set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
     if not exist "!VSWHERE!" (
         echo error: vswhere.exe not found; run this from a Developer Command Prompt.
         exit /b 1
     )
     for /f "usebackq tokens=*" %%i in (`"!VSWHERE!" -latest -property installationPath`) do set "VSPATH=%%i"
-    if not exist "!VSPATH!\VC\Auxiliary\Build\vcvars64.bat" (
-        echo error: could not locate vcvars64.bat under "!VSPATH!".
+    if not exist "!VSPATH!\VC\Auxiliary\Build\!VCVARS!" (
+        echo error: could not locate !VCVARS! under "!VSPATH!".
         exit /b 1
     )
-    call "!VSPATH!\VC\Auxiliary\Build\vcvars64.bat" >nul
+    call "!VSPATH!\VC\Auxiliary\Build\!VCVARS!" >nul
 )
 
 if not exist "%OUT%" mkdir "%OUT%"
 
-echo === building MemoryModule64.dll under test -^> stress\bin ===
+echo === building %MMDLL% under test -^> %OUT% ===
 rem
 rem OutDir/IntDir are passed unquoted on purpose. A quoted MSBuild property that
 rem ends in a backslash ("...\bin\") escapes the closing quote, the override is
@@ -44,7 +79,7 @@ rem silently dropped, and the build lands in nativelibs\lib-bin instead --
 rem overwriting the signed shipping DLL. Keep these paths space-free.
 rem
 msbuild "%ROOT%\MemoryModule\MemoryModule.vcxproj" /t:Build ^
-    /p:Configuration=ReleaseDll /p:Platform=x64 ^
+    /p:Configuration=ReleaseDll /p:Platform=%MSBUILD_PLATFORM% ^
     /p:SolutionDir=%ROOT%\ ^
     /p:OutDir=%OUT%\ ^
     /p:IntDir=%OUT%\obj\ ^
@@ -111,15 +146,15 @@ rem
 rem Fail loudly here rather than at runtime: everything must be x64 or the
 rem harness cannot load the DLL under test.
 rem
-for %%f in ("%OUT%\stress.exe" "%OUT%\stresspayload.dll" "%OUT%\MemoryModule64.dll") do (
-    dumpbin /headers "%%~f" 2>nul | findstr /c:"8664 machine (x64)" >nul
+for %%f in ("%OUT%\stress.exe" "%OUT%\stresspayload.dll" "%OUT%\!MMDLL!") do (
+    dumpbin /headers "%%~f" 2>nul | findstr /c:"!MACHINE_TAG!" >nul
     if errorlevel 1 (
-        echo error: %%~nxf is not x64. Build it from an x64 toolchain.
+        echo error: %%~nxf is not !ARCH!. Build it from an !ARCH! toolchain.
         exit /b 1
     )
 )
 
 echo.
-echo built into %OUT%  ^(all x64^)
-echo   run: "%OUT%\stress.exe" --dll "%OUT%\MemoryModule64.dll" --payload "%OUT%\stresspayload.dll"
+echo built into %OUT%  ^(all %ARCH%^)
+echo   run: "%OUT%\stress.exe" --dll "%OUT%\%MMDLL%" --payload "%OUT%\stresspayload.dll"
 endlocal

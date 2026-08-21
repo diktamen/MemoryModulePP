@@ -12,10 +12,33 @@ instead of by reading.
 
 ## What is currently broken
 
-**Where it stands.** One open bug, and it is not ours. Measured at 8 loader
-threads plus 8 noise over 200 iterations, 8 runs each: 7/8 clean now, against
-5/8 before the `LdrpHashTable` change below. Roughly a 12% failure rate, down
-from about a third. Not clean.
+**Build arm64 and test there.** `build.cmd arm64` produces a native ARM64
+harness in `stress\bin-arm64`. On this host that is roughly **8x faster** than
+the x64 build, which runs under emulation: the same 8+8 configuration takes ~6s
+instead of ~50s. More loader operations per second means more contention, and it
+finds far more. Prefer it for measurement, and note that the x64 numbers below
+are correspondingly optimistic.
+
+**Where it stands, measured on arm64** with real sample sizes:
+
+```
+ 8 loaders +  8 noise, 200it, 16 runs    9/16 pass   4 fast-fail  3 soft
+24 loaders + 12 noise, 200it, 12 runs    6/12 pass   2 fast-fail  4 soft
+```
+
+So about half of runs fail. The same configuration on emulated x64 was 7/8,
+which is the sampling trap again in a new guise: the slower environment simply
+does not generate enough contention to expose the rate.
+
+Two distinct open defects:
+
+1. **`__fastfail`, exit `0xC0000409`** -- ntdll's own list validation, detailed
+   below. Reproduces on native arm64 as well as x64, so it is a real logic bug
+   and not an emulation artifact.
+2. **A rare wrong answer from the payload**, about 1 ping in 1600. With the TLS
+   payload `StressPing` round-trips through `thread_local`, so a wrong result
+   means this module's TLS was not correct for that thread on that call. Much
+   rarer than the fast-fail and not yet investigated.
 
 **Symptom.** Exit `0xC0000409`. Caught under `cdb`, the subcode and stack are
 unambiguous:
@@ -45,10 +68,30 @@ its `Modules`/dependency lists are the obvious suspects, since
 `RtlFreeLdrDataTableEntry` dismantles them and can re-enter ntdll through
 `LdrUnloadDll` while our entry is still linked.
 
-Worth noting for anyone reading the stacks: this machine is ARM64 running the
-x64 harness under emulation, so stacks carry `ARM64EC` frames and
-`CpuSetInSyscallCallback`-style artifacts. Nothing here has been confirmed on
-native x64.
+Worth noting for anyone reading x64 stacks on this host: they carry `ARM64EC`
+frames and `CpuSetInSyscallCallback`-style artifacts, because the x64 harness is
+emulated. Build arm64 to get clean stacks. Nothing here has been confirmed on a
+genuinely x64 machine.
+
+### Two corrections about arm64 and TLS
+
+**TLS works on arm64.** An earlier claim in this investigation was that it could
+not, because `RtlFindLdrpHandleTlsData10` searches for x64 opcodes
+(`48 8D 15`, `lea rdx,[rip+disp32]`) that an ARM64 ntdll would not contain. That
+reasoning was wrong: ntdll on this host is **ARM64X**, a hybrid image carrying
+both ARM64 and x64 code, so the pattern is present and the located target is
+callable. Measured: 3 runs of 1600 per-thread TLS round-trips each, zero
+failures. So hardcoding per-build anchors for the bench, which would be easy
+given public symbols do export `LdrpHandleTlsData`
+(RVA `0xD2270` in ntdll 10.0.26100.8972, timestamp `0x105BCDDA`), is not
+necessary. Keep those numbers in mind only if a future ntdll drops the x64 half.
+
+**The no-TLS payload had a bug of its own.** With `STRESS_NO_TLS`, `t_tlsSlot`
+becomes a plain static shared by every thread, so `StressPing` reading it back
+raced and produced about 30 bogus ping failures per 1600 calls -- which looked
+exactly like a loader defect. That variant now derives its answer from its
+argument. If you add a probe here, make sure it cannot fail for reasons of its
+own.
 
 ### Correction: there was never a deadlock here
 

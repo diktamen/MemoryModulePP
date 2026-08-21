@@ -64,7 +64,21 @@ extern "C" __declspec(dllexport) int StressPing(int value) {
         *p = 1;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
+#ifdef STRESS_NO_TLS
+        //
+        // t_tlsSlot is a plain static in this build, so it is shared by every
+        // thread and reading it back would race. Derive the answer from the
+        // argument instead. Doing otherwise cost about 30 bogus ping failures
+        // per 1600 calls and looked exactly like a loader bug.
+        //
+        return value + 1;
+#else
+        //
+        // Round-trip through thread-local storage on purpose: a wrong answer
+        // here means this module's TLS was not set up per-thread.
+        //
         return t_tlsSlot + 1;
+#endif
     }
 
     return -1;
@@ -78,7 +92,14 @@ extern "C" __declspec(dllexport) int StressPing(int value) {
 //
 extern "C" __declspec(dllexport) int StressPingNoSeh(int value) {
     t_tlsSlot = value;
+#ifdef STRESS_NO_TLS
+    //
+    // Shared static in this build; see the note in StressPing.
+    //
+    return value + 1;
+#else
     return t_tlsSlot + 1;
+#endif
 }
 
 extern "C" __declspec(dllexport) int StressAttachCount() {
