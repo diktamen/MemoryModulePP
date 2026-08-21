@@ -324,6 +324,24 @@ NTSTATUS NTAPI LdrUnloadDllMemory(_In_ HMEMORYMODULE BaseAddress) {
 			break;
 		}
 
+		//
+		// Another thread is already tearing this module down. Its
+		// DLL_PROCESS_DETACH runs outside the lock, so we can arrive here while
+		// that is in flight, and the reference count no longer says anything
+		// useful because the unloading thread stopped consulting it once it
+		// committed. Running on would perform the teardown a second time:
+		// unlinking the loader entry twice, and freeing the import handle list
+		// and the image twice. The module structure lives inside the image, so
+		// after the first VirtualFree() this structure is released memory, and
+		// the second pass reads a garbage hModulesList and hands it to
+		// RtlFreeHeap() -- which is the heap corruption the stress harness hit
+		// at high thread counts.
+		//
+		if (module->underUnload) {
+			status = STATUS_INVALID_HANDLE;
+			break;
+		}
+
 		//Mapping dll failed
 		if (!module->MappedDll) {
 			module->underUnload = true;
