@@ -37,32 +37,6 @@ typedef struct _MMP_TLS_DATA {
 	}Hooks;
 }MMP_TLS_DATA, * PMMP_TLS_DATA;
 
-//MmpDotNet.cpp
-typedef struct _MMP_DOT_NET_DATA {
-	FILETIME AssemblyTimes;
-
-	CRITICAL_SECTION MmpFakeHandleListLock;
-	LIST_ENTRY MmpFakeHandleListHead;
-
-	BOOLEAN PreHooked;
-	BOOLEAN Initialized;
-
-	struct {
-		decltype(&CreateFileW) OriginCreateFileW;
-		decltype(&GetFileInformationByHandle) OriginGetFileInformationByHandle;
-		decltype(&GetFileAttributesExW) OriginGetFileAttributesExW;
-		decltype(&GetFileSize) OriginGetFileSize;
-		decltype(&GetFileSizeEx) OriginGetFileSizeEx;
-		decltype(&CreateFileMappingW) OriginCreateFileMappingW;
-		decltype(&MapViewOfFileEx) OriginMapViewOfFileEx;
-		decltype(&MapViewOfFile) OriginMapViewOfFile;
-		decltype(&UnmapViewOfFile)OriginUnmapViewOfFile;
-		decltype(&CloseHandle)OriginCloseHandle;
-		GetFileVersion_T OriginGetFileVersion1;
-		GetFileVersion_T OriginGetFileVersion2;
-	}Hooks;
-}MMP_DOT_NET_DATA, * PMMP_DOT_NET_DATA;
-
 typedef struct _MMP_FUNCTIONS {
 	decltype(&LdrLoadDllMemoryExW) _LdrLoadDllMemoryExW;
 	decltype(&LdrUnloadDllMemory) _LdrUnloadDllMemory;
@@ -100,7 +74,7 @@ typedef enum class _WINDOWS_VERSION :BYTE {
 #define MEMORY_MODULE_GET_MINOR_VERSION(MinorVersion) (~0x8000&(MinorVersion))
 
 #define MEMORY_MODULE_MAJOR_VERSION 2
-#define MEMORY_MODULE_MINOR_VERSION MEMORY_MODULE_MAKE_PREVIEW(2)
+#define MEMORY_MODULE_MINOR_VERSION MEMORY_MODULE_MAKE_PREVIEW(3)
 
 typedef struct _MMP_GLOBAL_DATA {
 
@@ -129,8 +103,6 @@ typedef struct _MMP_GLOBAL_DATA {
 
 	PMMP_TLS_DATA MmpTls;
 
-	PMMP_DOT_NET_DATA MmpDotNet;
-
 	PVOID BaseAddress;
 
 	PMMP_FUNCTIONS MmpFunctions;
@@ -147,7 +119,6 @@ typedef struct _MMP_GLOBAL_DATA {
 	sizeof(MMP_INVERTED_FUNCTION_TABLE_DATA) + \
 	sizeof(MMP_LDR_ENTRY_DATA) + \
 	sizeof(MMP_TLS_DATA) + \
-	sizeof(MMP_DOT_NET_DATA) + \
 	sizeof(MMP_FUNCTIONS) + \
 	sizeof(PMMP_IAT_DATA)\
 )

@@ -36,9 +36,6 @@
 //tls support
 #include "MmpTls.h"
 
-//DotNet support
-#include "MmpDotNet.h"
-
 //MemoryModulePP api interface
 #include "Loader.h"
 

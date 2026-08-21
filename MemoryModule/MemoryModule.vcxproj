@@ -67,21 +67,10 @@
     </ProjectConfiguration>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="..\3rdparty\Detours\creatwth.cpp" />
-    <ClCompile Include="..\3rdparty\Detours\detours.cpp" />
-    <ClCompile Include="..\3rdparty\Detours\disasm.cpp" />
-    <ClCompile Include="..\3rdparty\Detours\disolarm.cpp" />
-    <ClCompile Include="..\3rdparty\Detours\disolarm64.cpp" />
-    <ClCompile Include="..\3rdparty\Detours\disolia64.cpp" />
-    <ClCompile Include="..\3rdparty\Detours\disolx64.cpp" />
-    <ClCompile Include="..\3rdparty\Detours\disolx86.cpp" />
-    <ClCompile Include="..\3rdparty\Detours\image.cpp" />
-    <ClCompile Include="..\3rdparty\Detours\modules.cpp" />
     <ClCompile Include="ImportTable.cpp" />
     <ClCompile Include="Initialize.cpp" />
     <ClCompile Include="LoadDllMemoryApi.cpp" />
     <ClCompile Include="MemoryModule.cpp" />
-    <ClCompile Include="MmpDotNet.cpp" />
     <ClCompile Include="MmpTlsFiber.cpp" />
     <ClCompile Include="MmpLdrpTls.cpp" />
     <ClCompile Include="MmpTls.cpp" />
@@ -118,8 +107,6 @@
     <ClCompile Include="Utils.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="..\3rdparty\Detours\detours.h" />
-    <ClInclude Include="..\3rdparty\Detours\detver.h" />
     <ClInclude Include="..\3rdparty\phnt\include\ntbcd.h" />
     <ClInclude Include="..\3rdparty\phnt\include\ntdbg.h" />
     <ClInclude Include="..\3rdparty\phnt\include\ntexapi.h" />
@@ -156,7 +143,6 @@
     <ClInclude Include="LoadDllMemoryApi.h" />
     <ClInclude Include="LoaderPrivate.h" />
     <ClInclude Include="MemoryModule.h" />
-    <ClInclude Include="MmpDotNet.h" />
     <ClInclude Include="MmpTlsFiber.h" />
     <ClInclude Include="MmpGlobalData.h" />
     <ClInclude Include="MmpTls.h" />

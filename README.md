@@ -37,7 +37,6 @@ MemoryModulePP, used to load a DLL from memory. MemoryModulePP is compatible wit
   - DllMain can receive four types of notifications
   - Support forward export
   - Support ```SetUnhandledExceptionFilter()```
-  - Provides limited support for .NET assembly loading
 
 ## Tech
 

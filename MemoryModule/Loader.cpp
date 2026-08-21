@@ -195,17 +195,9 @@ NTSTATUS NTAPI LdrLoadDllMemoryExW(
 			}
 		}
 
-		if (dwFlags & LOAD_FLAGS_HOOK_DOT_NET) {
-			MmpPreInitializeHooksForDotNet();
-		}
-
 		if (!LdrpExecuteTLS(module) || !LdrpCallInitializers(module, DLL_PROCESS_ATTACH)) {
 			status = STATUS_DLL_INIT_FAILED;
 			break;
-		}
-
-		if (dwFlags & LOAD_FLAGS_HOOK_DOT_NET) {
-			MmpInitializeHooksForDotNet();
 		}
 
 	} while (false);

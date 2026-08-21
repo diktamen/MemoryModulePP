@@ -1,0 +1,6 @@
+msbuild /p:Configuration=Debug /p:Platform="x64" 
+msbuild /p:Configuration=Debug /p:Platform="x86"  
+msbuild /p:Configuration=Debug /p:Platform="arm64" 
+msbuild /p:Configuration=Release /p:Platform="x64" 
+msbuild /p:Configuration=Release /p:Platform="x86" 
+msbuild /p:Configuration=Release /p:Platform="arm64"  

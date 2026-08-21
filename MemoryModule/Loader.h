@@ -43,9 +43,6 @@
 //Dont call LdrpHandleTlsData routine if this flag is specified.
 #define LOAD_FLAGS_NOT_HANDLE_TLS					0x00080000
 
-//Hook for dotnet dlls
-#define LOAD_FLAGS_HOOK_DOT_NET						0x00100000
-
 extern "C" {
 
 	//Get the implementation of the currently running operating system.
