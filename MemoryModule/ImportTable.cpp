@@ -171,7 +171,7 @@ BOOL WINAPI MmRemoveImportTableResolver(_In_ HANDLE hMmIatResolver) {
 		return FALSE;
 	}
 
-	RemoveHeadList(&resolver->InMmpIatResolverList);
+	RemoveEntryList(&resolver->InMmpIatResolverList);
 	LeaveCriticalSection(&MmpGlobalDataPtr->MmpIat->MmpIatResolverListLock);
 
 	return RtlFreeHeap(heap, 0, hMmIatResolver);

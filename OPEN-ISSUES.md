@@ -150,19 +150,31 @@ growth racing a load.
 
 ---
 
-## 5. Latent list-corruption bug in the IAT resolver
+## 5. Latent list-corruption bug in the IAT resolver — FIXED
 
-**Status:** open, unambiguous, not reachable from the harness.
+**Status:** fixed; correct by inspection, never executed.
 
-`ImportTable.cpp` calls
-`RemoveHeadList(&resolver->InMmpIatResolverList)` where it means
-`RemoveEntryList`. `RemoveHeadList` unlinks the entry *after* `resolver` and
-leaves `resolver` itself linked — and the next line frees it. So
-`MmpIatResolverList`'s head is left pointing into freed heap.
+`MmRemoveImportTableResolver` in `ImportTable.cpp` called
+`RemoveHeadList(&resolver->InMmpIatResolverList)` where it meant
+`RemoveEntryList`. `RemoveHeadList(h)` unlinks `h->Flink`, treating its argument
+as a list *head*, so it removed the resolver registered *after* this one and left
+`resolver` itself linked — and the next line freed it. The list was left holding
+a pointer into freed heap, and an unrelated resolver was silently dropped.
 
-Reachable only through the public `MmRemoveImportTableResolver`, which nothing in
-this tree calls, so it has never fired. It is a one-word fix and should just be
-done.
+Now `RemoveEntryList`, which is the primitive that unlinks the entry you hand it.
+
+**This is not execution-tested, and cannot easily be.** Neither
+`MmRegisterImportTableResolver` nor `MmRemoveImportTableResolver` appears in
+`MemoryModulePP.def`, so they are unreachable from a consumer of the DLL and
+unreachable from the harness; the bug had never fired because the code cannot be
+called at all in the shipped surface. Verifying it by execution means adding both
+to the `.def`, which widens the public API and is a separate decision.
+
+If that is ever done, the check is cheap and deterministic. `InMmpIatResolverList`
+sits at offset 0 of `MM_IAT_RESOLVER` and the returned `HANDLE` is the struct
+pointer, so a test can read the links straight off the handles: register A, B, C;
+remove B; assert `A->Flink == C` and `C->Blink == A`. Under the old code
+`A->Flink` still pointed at the freed B and C had been unlinked instead.
 
 ---
 
