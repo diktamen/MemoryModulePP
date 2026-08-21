@@ -273,10 +273,33 @@ Three distinct problems in `BaseAddressIndex.cpp` and its caller:
    leaving ntdll's tree pointing into a freed heap block. That path now removes
    the node before returning. Needs an allocation failure to reach, so it is
    correct by inspection rather than by test.
-3. **Published before valid.** The node enters the tree before `DllBase`,
-   `SizeOfImage`, `BaseDllName` and `DdagNode` are filled in. The datatable lock
-   now covers this window, so ntdll cannot observe it — but the ordering is still
-   wrong and would break again if the lock were ever lost.
+3. **Published before valid — FIXED, and the previous note here was wrong.**
+   The node entered the tree before `DllBase`, `SizeOfImage`, `BaseDllName` and
+   `DdagNode` were filled in. This file used to claim "the datatable lock now
+   covers this window, so ntdll cannot observe it". **It did not.** The guard was
+   released at the end of the insert block, and the identity fields were assigned
+   much later — at the bottom of the `switch`, in the `xp` case every path falls
+   through to. Another thread's loader could take the lock in between, walk the
+   tree, and read a node whose key was still zero. The tree is keyed on
+   `DllBase`, so a zero key also breaks the ordering ntdll's own search relies
+   on.
+
+   Two changes. The identity fields (`DllBase`, `SizeOfImage`, `TimeDateStamp`,
+   both names, `EntryPoint`) are now set once at the top of
+   `RtlInitializeLdrDataTableEntry`, before anything can publish the entry. And
+   the index insert moved to the *end* of the win8 case, after `DdagNode` is
+   allocated and linked — so the tree receives a node that is already complete,
+   including the `DdagNode` ntdll dereferences when it walks.
+
+   That ordering also deletes a failure path rather than handling it: because
+   `DdagNode` is now allocated *before* the insert, the "inserted but not
+   removed" unwind added for item 2 became unreachable and is gone. The one
+   remaining failure between construction and return is the insert itself, which
+   frees `DdagNode` on the way out because the caller frees only the entry.
+
+   Verified as a no-regression rather than directly: 3 runs at 12+8 threads on
+   arm64, 2 on x64 under emulation, 2 on genuine x64, all exit `0` with zero
+   load, unload and integrity failures.
 
 Also: index discovery is skipped unless ntdll's tree root happens to be black, so
 on some runs the capability is silently absent and every memory load fails.

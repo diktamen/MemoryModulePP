@@ -108,6 +108,28 @@ BOOL NTAPI RtlInitializeLdrDataTableEntry(
 	HANDLE heap = NtCurrentPeb()->ProcessHeap;
 	bool FlagsProcessed = false;
 
+	//
+	// The entry's identity, set before anything publishes it anywhere.
+	//
+	// These used to live at the bottom of the switch, in the xp case that every
+	// path falls through to -- which put them *after* the base-address index
+	// insert in the win8 case. The index is a red-black tree keyed on DllBase,
+	// so it was being handed a node whose key was still zero, and ntdll's own
+	// search compares against that key. An earlier note claimed the datatable
+	// lock covered the window; it does not. The lock is released at the end of
+	// the insert block and DllBase was assigned well after that, so another
+	// thread's loader could take the lock, walk the tree, and read the zero.
+	//
+	// Nothing below depends on them being late, so they are set once, here.
+	//
+	LdrEntry->DllBase = BaseAddress;
+	LdrEntry->SizeOfImage = headers->OptionalHeader.SizeOfImage;
+	LdrEntry->TimeDateStamp = headers->FileHeader.TimeDateStamp;
+	LdrEntry->BaseDllName = DllBaseName;
+	LdrEntry->FullDllName = DllFullName;
+	LdrEntry->EntryPoint = (PLDR_INIT_ROUTINE)((size_t)BaseAddress + headers->OptionalHeader.AddressOfEntryPoint);
+	LdrEntry->ObsoleteLoadCount = 1;
+
 	bool CorImage = false, CorIL = false;
 	auto& com = headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR];
 	if (com.Size && com.VirtualAddress) {
@@ -139,33 +161,8 @@ BOOL NTAPI RtlInitializeLdrDataTableEntry(
 		entry->OriginalBase = headers->OptionalHeader.ImageBase;
 		entry->BaseNameHashValue = LdrHashEntry(DllBaseName, false);
 		entry->LoadReason = LoadReasonDynamicLoad;
-		//
-		// The base-address index is ntdll's red-black tree, guarded by
-		// ntdll!LdrpModuleDatatableLock. The walk that finds the insertion point
-		// reads nodes ntdll may be rebalancing, so the lock has to cover the
-		// search as well as the insert, which is why it is taken out here rather
-		// than inside RtlInsertModuleBaseAddressIndexNode.
-		//
-		BOOLEAN indexed = FALSE;
-		{
-			MmpDatatableLockGuard databaseLock;
-			if (!NT_SUCCESS(RtlInsertModuleBaseAddressIndexNode(LdrEntry, BaseAddress, &indexed)))return FALSE;
-		}
-
 		if (!(entry->DdagNode = (decltype(entry->DdagNode))
-			RtlAllocateHeap(heap, HEAP_ZERO_MEMORY, IsWin8 ? sizeof(_LDR_DDAG_NODE_WIN8) : sizeof(_LDR_DDAG_NODE)))) {
-			//
-			// The node is already in ntdll's tree and the caller is about to free
-			// this entry. Take it back out first; otherwise ntdll's index is left
-			// pointing into a freed heap block, and nothing later knows to remove
-			// it because InIndexes below never got set.
-			//
-			if (indexed) {
-				MmpDatatableLockGuard databaseLock;
-				RtlRemoveModuleBaseAddressIndexNode(LdrEntry);
-			}
-			return FALSE;
-		}
+			RtlAllocateHeap(heap, HEAP_ZERO_MEMORY, IsWin8 ? sizeof(_LDR_DDAG_NODE_WIN8) : sizeof(_LDR_DDAG_NODE))))return FALSE;
 
 		entry->NodeModuleLink.Flink = &entry->DdagNode->Modules;
 		entry->NodeModuleLink.Blink = &entry->DdagNode->Modules;
@@ -176,12 +173,6 @@ BOOL NTAPI RtlInitializeLdrDataTableEntry(
 		if (IsWin8) ((_LDR_DDAG_NODE_WIN8*)(entry->DdagNode))->ReferenceCount = 1;
 		entry->ImageDll = entry->LoadNotificationsSent = entry->EntryProcessed =
 			entry->InLegacyLists = true;
-		//
-		// Only what actually went into the tree, never an unconditional true:
-		// this bit is what teardown reads to decide whether to hand ntdll a node
-		// to remove.
-		//
-		entry->InIndexes = indexed;
 		entry->ProcessAttachCalled = false;
 
 		//
@@ -204,6 +195,42 @@ BOOL NTAPI RtlInitializeLdrDataTableEntry(
 		entry->CorImage = CorImage;
 		entry->CorILOnly = CorIL;
 
+		//
+		// Publish last. Everything above is private to this thread -- the entry
+		// is not in any of ntdll's structures yet -- so the tree receives a node
+		// that is already complete: DllBase set (it is the key), SizeOfImage,
+		// both names, and a live DdagNode, which ntdll dereferences when it
+		// walks. Inserting first and filling in afterwards left a window in
+		// which ntdll could read a node keyed on zero.
+		//
+		// The lock covers the search as well as the insert, not just the write:
+		// the walk that finds the insertion point reads nodes ntdll may be
+		// rebalancing. That is why it is taken here rather than inside
+		// RtlInsertModuleBaseAddressIndexNode.
+		//
+		// Nothing between here and the return can fail, so there is no
+		// half-published state to unwind.
+		//
+		BOOLEAN indexed = FALSE;
+		{
+			MmpDatatableLockGuard databaseLock;
+			if (!NT_SUCCESS(RtlInsertModuleBaseAddressIndexNode(LdrEntry, BaseAddress, &indexed))) {
+				//
+				// The caller frees the entry but not this, so it has to go here.
+				//
+				RtlFreeHeap(heap, 0, entry->DdagNode);
+				entry->DdagNode = nullptr;
+				return FALSE;
+			}
+		}
+
+		//
+		// Only what actually went into the tree, never an unconditional true:
+		// this bit is what teardown reads to decide whether to hand ntdll a node
+		// to remove.
+		//
+		entry->InIndexes = indexed;
+
 		FlagsProcessed = true;
 	}
 
@@ -224,13 +251,7 @@ BOOL NTAPI RtlInitializeLdrDataTableEntry(
 		}
 	}
 	case WINDOWS_VERSION::xp: {
-		LdrEntry->DllBase = BaseAddress;
-		LdrEntry->SizeOfImage = headers->OptionalHeader.SizeOfImage;
-		LdrEntry->TimeDateStamp = headers->FileHeader.TimeDateStamp;
-		LdrEntry->BaseDllName = DllBaseName;
-		LdrEntry->FullDllName = DllFullName;
-		LdrEntry->EntryPoint = (PLDR_INIT_ROUTINE)((size_t)BaseAddress + headers->OptionalHeader.AddressOfEntryPoint);
-		LdrEntry->ObsoleteLoadCount = 1;
+		// Identity is set at the top of the function now; see the note there.
 		if (!FlagsProcessed) {
 			LdrEntry->Flags = LDRP_IMAGE_DLL | LDRP_ENTRY_INSERTED | LDRP_ENTRY_PROCESSED;
 
