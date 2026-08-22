@@ -1,11 +1,28 @@
-# Open issues
+# Open issues — SUPERSEDED, kept as a historical record
 
-What is still wrong, or still unproven, in MemoryModulePP after the
-`LdrpModuleDatatableLock` fix. Written to be read on its own:
-`stress/README.md` is the investigation log and has grown into an archaeology
-site, so this file is the short answer to "what should still worry me".
+> **Read `STILL-OPEN-ISSUES.md` instead.** Most of what is below has been fixed,
+> and this file is no longer maintained.
+>
+> It is kept because the fixes are easier to understand next to the reasoning
+> that produced them, and because several diagnoses here turned out to be
+> **wrong** in ways worth not repeating. Three in particular:
+>
+> - Issue 7 claimed the datatable lock covered the publish-before-valid window.
+>   It did not — the guard was released before the identity fields were written.
+> - Issue 7 blamed index-discovery flakiness on the tree root's colour. Driving
+>   ntdll's own `RtlRb*` over 200,255 operations found zero red roots; the real
+>   cause was that discovery ran with no lock, because the lock was located
+>   thirteen lines later.
+> - Issue 4 assumed the TLS defect was MemoryModulePP's TLS handling. On two of
+>   three configurations that code never runs at all.
+>
+> The pattern in all three: a plausible mechanism recorded as fact without a
+> measurement behind it. The corrections came from building a probe, not from
+> reading harder.
 
-Ordered by how likely it is to bite in production.
+What was still wrong, or still unproven, in MemoryModulePP after the
+`LdrpModuleDatatableLock` fix, ordered by how likely it was to bite in
+production.
 
 ---
 
