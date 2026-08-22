@@ -61,6 +61,37 @@ undiagnosable process kill.
 Gate on the entry-thunk marker. Stop discarding `MmpTlsInitialize()`'s return.
 See §2 for the probe results.
 
+### What became of "about one wrong answer per few thousand calls"
+
+The old issue 4 recorded roughly 1 wrong `StressPing` in 1,600 on arm64 and 1 in
+12,800 on genuine x64, and assumed it was `MmpHandleTlsData`. Both halves are now
+answered, and neither the way it was framed.
+
+**On arm64 and ARM64X there is nothing to attribute it to** — `MmpHandleTlsData`
+never runs. Whatever that rate was, it was the behaviour of an unallocated TLS
+index, not of the TLS code. Fixing §1 is what would change it.
+
+**On genuine x64, where the TLS path does run, it is not reproducible.**
+`stress --native` swaps only the loader and changes nothing else, so both arms
+are directly comparable:
+
+| arm | fresh loads | ping failures |
+| --- | --- | --- |
+| MemoryModulePP | 120,000 | **0** |
+| ordinary `LoadLibraryW` | 120,000 | **0** |
+
+At 1 in 12,800 the MemoryModulePP arm should have shown about 9. Zero in 120,000
+puts the 95% upper bound (rule of three) at **1 in 40,000** — at least three times
+better than the recorded rate, and consistent with none at all. No difference
+between the two loaders is detectable at this sample size.
+
+Honest caveat: **one** ping failure was observed on that box earlier in the same
+session, in a single 1,200-load run, on a build predating several of the fixes
+since made. So "gone" is not proven — "below 1 in 40,000, and indistinguishable
+from the ordinary Windows loader" is what the measurement supports. Anyone
+re-opening this should re-measure with `stress --native` rather than trusting
+either number, and should check the `features` line first.
+
 ---
 
 ## 2. Every ntdll internal except the datatable lock is still pattern-scanned
