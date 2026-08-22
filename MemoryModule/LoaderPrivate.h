@@ -25,10 +25,28 @@ struct MmpLoaderLockGuard {
 	bool Held = false;
 
 	//
+	// Set once in the constructor and never cleared, so it stays meaningful after
+	// a deliberate Release() -- which also leaves Held false.
+	//
+	bool AcquireFailed = false;
+
+	//
 	// Acquisition must not silently fall through to unserialized access: the
 	// caller is about to splice ntdll's module lists, and doing that without the
 	// lock is exactly what corrupts them. Retry until the lock is genuinely
 	// held, the way ntdll's own callers do.
+	//
+	// This used to give up after 64 attempts and carry on with Held == false,
+	// which is the one thing a caller about to splice ntdll's structures must
+	// never do. Worse, with Held == false the IAT resolver lock was then taken
+	// *before* the loader lock, inverting the order used everywhere else and
+	// opening a genuine AB-BA deadlock against any other thread. The counter has
+	// read 0 across every measurement, so this has never fired -- but "never
+	// observed" is not a reason to leave the unsafe branch in place.
+	//
+	// Failure is now reported instead. Load paths fail the load; teardown paths,
+	// which have no way to decline, treat it as fatal -- the same judgement the
+	// unlink failures in LdrUnloadDllMemory already make.
 	//
 	MmpLoaderLockGuard() {
 		for (ULONG attempt = 0; attempt < 64 && !Held; ++attempt) {
@@ -42,7 +60,14 @@ struct MmpLoaderLockGuard {
 				MmpLoaderLockAcquireFailures++;
 			}
 		}
+		AcquireFailed = !Held;
 	}
+
+	//
+	// True when the lock could not be taken at all. Distinct from !Held, which is
+	// also the normal state after a deliberate Release().
+	//
+	bool Failed() const { return AcquireFailed; }
 	~MmpLoaderLockGuard() { Release(); }
 
 	//

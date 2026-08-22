@@ -121,6 +121,13 @@ NTSTATUS NTAPI LdrLoadDllMemoryExW(
 	// the Release() calls below.
 	//
 	MmpLoaderLockGuard loaderLock;
+	//
+	// Decline rather than publish unserialized. The guard used to carry on with
+	// Held == false after 64 failed attempts, which is exactly what must not
+	// happen on a path about to splice ntdll's module lists -- and it inverted
+	// the loader-lock-then-resolver-lock order into an AB-BA deadlock besides.
+	//
+	if (loaderLock.Failed()) return STATUS_LOCK_NOT_GRANTED;
 
 	if (dwFlags & LOAD_FLAGS_NOT_MAP_DLL) {
 		dwFlags &= LOAD_FLAGS_NOT_MAP_DLL;
@@ -344,6 +351,7 @@ NTSTATUS NTAPI LdrUnloadDllMemory(_In_ HMEMORYMODULE BaseAddress) {
 	// outside the lock is a use after free.
 	//
 	MmpLoaderLockGuard loaderLock;
+	if (loaderLock.Failed()) return STATUS_LOCK_NOT_GRANTED;
 
 	PMEMORYMODULE module = MapMemoryModuleHandle(BaseAddress);
 	PIMAGE_NT_HEADERS headers = RtlImageNtHeader(BaseAddress);

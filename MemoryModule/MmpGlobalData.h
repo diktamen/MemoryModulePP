@@ -120,7 +120,7 @@ typedef struct _MMP_GLOBAL_DATA {
 	sizeof(MMP_LDR_ENTRY_DATA) + \
 	sizeof(MMP_TLS_DATA) + \
 	sizeof(MMP_FUNCTIONS) + \
-	sizeof(PMMP_IAT_DATA)\
+	sizeof(MMP_IAT_DATA)\
 )
 
 extern PMMP_GLOBAL_DATA MmpGlobalDataPtr;

@@ -187,6 +187,7 @@ NTSTATUS NTAPI RtlInsertInvertedFunctionTable(
 	NTSTATUS status;
 
 	MmpLoaderLockGuard loaderLock;
+	if (loaderLock.Failed()) return STATUS_LOCK_NOT_GRANTED;
 
 	auto table = PRTL_INVERTED_FUNCTION_TABLE(MmpGlobalDataPtr->MmpInvertedFunctionTable->LdrpInvertedFunctionTable);
 	if (!table)return STATUS_NOT_SUPPORTED;
@@ -209,6 +210,7 @@ NTSTATUS NTAPI RtlRemoveInvertedFunctionTable(_In_ PVOID ImageBase) {
 	NTSTATUS status;
 
 	MmpLoaderLockGuard loaderLock;
+	if (loaderLock.Failed()) return STATUS_LOCK_NOT_GRANTED;
 
 	auto table = PRTL_INVERTED_FUNCTION_TABLE(MmpGlobalDataPtr->MmpInvertedFunctionTable->LdrpInvertedFunctionTable);
 	if (!table)return STATUS_NOT_SUPPORTED;

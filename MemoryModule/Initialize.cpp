@@ -222,10 +222,21 @@ PLIST_ENTRY FindLdrpHashTable() {
 		PLDR_DATA_TABLE_ENTRY current = CONTAINING_RECORD(entry, LDR_DATA_TABLE_ENTRY, LDR_DATA_TABLE_ENTRY::InInitializationOrderLinks);
 		PLIST_ENTRY hashEntry = &current->HashLinks;
 
+		//
+		// A module alone in its bucket: its HashLinks ring has exactly one member,
+		// so Flink is the bucket head and the bucket index is the module's hash.
+		//
 		if (hashEntry->Flink != hashEntry && hashEntry->Flink->Flink == hashEntry) {
 			PLIST_ENTRY table = &hashEntry->Flink[-(LONG)LdrHashEntry(current->BaseDllName)];
 
-			return IsValidLdrpHashTable(table) ? table : nullptr;
+			//
+			// Keep looking rather than giving up on the first candidate that does
+			// not validate. This used to return nullptr here, so one module whose
+			// ring was momentarily inconsistent -- or one whose name hashes
+			// differently than this build computes -- disabled the hash table for
+			// the entire process lifetime, with no way to tell why.
+			//
+			if (IsValidLdrpHashTable(table)) return table;
 		}
 
 		entry = entry->Flink;
@@ -402,9 +413,12 @@ NTSTATUS MmpAllocateGlobalData() {
 			PAGE_READWRITE
 		);
 
-		if (!NT_SUCCESS(status)) {
-			NtClose(hSection);
-		}
+		//
+		// Close the handle either way. The mapping keeps the section alive, so
+		// holding the handle past this point bought nothing and leaked it for the
+		// life of the process on the success path.
+		//
+		NtClose(hSection);
 	}
 	else {
 		if (status == STATUS_OBJECT_NAME_COLLISION) {
@@ -540,7 +554,23 @@ NTSTATUS InitializeLockHeld() {
 		MmpGlobalDataPtr->MmpBaseAddressIndex->_RtlRbInsertNodeEx = GetProcAddress((HMODULE)pNtdllEntry->DllBase, "RtlRbInsertNodeEx");
 		MmpGlobalDataPtr->MmpBaseAddressIndex->_RtlRbRemoveNode = GetProcAddress((HMODULE)pNtdllEntry->DllBase, "RtlRbRemoveNode");
 
+		//
+		// Only x86 still reaches LdrpInvertedFunctionTable. Since ReflectiveMapDll
+		// moved to MmpRegisterExceptionTable there is no caller of it on 64-bit at
+		// all, so scanning for it there is pure downside: a wrong hit sets a
+		// feature bit and hands out an address nothing should use, while a right
+		// one buys nothing. On x86 MmpRegisterExceptionTable still falls back to
+		// the inverted table, so keep looking there.
+		//
+		// The scan itself is a byte pattern with hardcoded struct offsets and a
+		// hardcoded MaxCount of 0x200; stress/probe_ift.cpp derives all of those
+		// instead and confirms the constants are right on every build measured.
+		//
+#ifndef _WIN64
 		MmpGlobalDataPtr->MmpInvertedFunctionTable->LdrpInvertedFunctionTable = FindLdrpInvertedFunctionTable();
+#else
+		MmpGlobalDataPtr->MmpInvertedFunctionTable->LdrpInvertedFunctionTable = nullptr;
+#endif
 
         MmpGlobalDataPtr->MmpFeatures = MEMORY_FEATURE_SUPPORT_VERSION | MEMORY_FEATURE_LDRP_HEAP | MEMORY_FEATURE_LDRP_HANDLE_TLS_DATA | MEMORY_FEATURE_LDRP_RELEASE_TLS_ENTRY;
         if (MmpGlobalDataPtr->MmpBaseAddressIndex->LdrpModuleBaseAddressIndex)MmpGlobalDataPtr->MmpFeatures |= MEMORY_FEATURE_MODULE_BASEADDRESS_INDEX;
@@ -561,7 +591,19 @@ NTSTATUS InitializeLockHeld() {
 		MmpGlobalDataPtr->MmpIat->MmpIatResolverHead.ReferenceCount = 1;
 		InsertTailList(&MmpGlobalDataPtr->MmpIat->MmpIatResolverList, &MmpGlobalDataPtr->MmpIat->MmpIatResolverHead.InMmpIatResolverList);
 
-		MmpTlsInitialize();
+		//
+		// A FALSE return means TLS handling is unavailable: either the helpers
+		// could not be located, or they were located and this process must not
+		// call them (the ARM64EC case). Not fatal -- a caller passing
+		// LOAD_FLAGS_NOT_HANDLE_TLS, or loading modules without a TLS directory,
+		// is unaffected -- but it must not be invisible the way it used to be.
+		// MmpTlsInitialize has already cleared the feature bit;
+		// LdrQuerySystemMemoryModuleFeatures and the exported MmpTlsLocated /
+		// MmpTlsRefused say which of the two happened.
+		//
+		if (!MmpTlsInitialize()) {
+			MmpGlobalDataPtr->MmpFeatures &= ~MEMORY_FEATURE_LDRP_RELEASE_TLS_ENTRY;
+		}
 
     } while (false);
 
@@ -744,6 +786,7 @@ extern "C" __declspec(dllexport) BOOL WINAPI ReflectiveMapDll(HMODULE hModule) {
 	// lock is recursive, so covering both cases costs nothing.
 	//
 	MmpLoaderLockGuard loaderLock;
+	if (loaderLock.Failed()) return FALSE;
 
 	PLDR_DATA_TABLE_ENTRY ModuleEntry = nullptr;
 	status = LdrMapDllMemory(hModule, 0, nullptr, nullptr, &ModuleEntry);
