@@ -1,258 +1,34 @@
 #include "stdafx.h"
-#include "LoaderPrivate.h"
 
 //
-// LdrpInvertedFunctionTable is a process-global structure owned by ntdll.
-// ntdll mutates it from its own loader (LdrpInsertInvertedFunctionTableEntry)
-// while holding the loader lock, and the RtlProtectMrdata() flip below toggles
-// the protection of that shared page process-wide. Mutating it here without the
-// loader lock races ntdll's concurrent DLL loads (e.g. an EDR agent or codec
-// loading on another thread): the entry count/array or the page protection are
-// observed mid-update, and the RtlMoveMemory() shift then runs with a corrupt
-// length and writes past the table. Take the loader lock (MmpLoaderLockGuard,
-// declared in LoaderPrivate.h) for the whole read-modify-write so we are
-// mutually exclusive with ntdll.
+// Publishing a memory module's unwind info.
+//
+// This file used to carry a second implementation that edited ntdll's
+// LdrpInvertedFunctionTable in place. That table is a fixed-size array in
+// ntdll's .mrdata, and reaching it meant flipping that shared page writable and
+// back with RtlProtectMrdata(). ntdll flips the same page for its own inserts
+// and serializes that on a lock we cannot take, so our flip raced its flip no
+// matter what we held: we either wrote to a page ntdll had just made read-only,
+// or made it read-only underneath ntdll's own write. Both were reproducible
+// under stress/stress.cpp as a crash in the RtlMoveMemory() shift or as a
+// loader-wide hang, identically with and without the loader lock.
+//
+// RtlAddFunctionTable() is the documented way to do this and has none of those
+// problems: ntdll guards its dynamic function table itself,
+// RtlLookupFunctionEntry consults it for addresses not in the inverted table,
+// and it has no fixed capacity -- which also drops the ceiling the 0x200-entry
+// array imposed on concurrently loaded memory modules. It is what JITs use for
+// generated code.
+//
+// The inverted-table path survived only for x86, which has no equivalent API.
+// With x86 support removed there is no caller left, so the pattern scan that
+// located the table, its hardcoded struct offsets and MaxCount, and
+// RtlProtectMrdata are all gone with it.
 //
 
-static VOID RtlpInsertInvertedFunctionTable(
-	_In_ PRTL_INVERTED_FUNCTION_TABLE InvertedTable,
-	_In_ PVOID ImageBase,
-	_In_ ULONG SizeOfImage) {
-#ifdef _WIN64
-	ULONG CurrentSize;
-	PIMAGE_RUNTIME_FUNCTION_ENTRY FunctionTable;
-	ULONG Index;
-	ULONG SizeOfTable = 0;
-	bool IsWin8OrGreater = RtlIsWindowsVersionOrGreater(6, 2, 0);
-
-	Index = (ULONG)IsWin8OrGreater;
-	CurrentSize = InvertedTable->Count;
-	if (CurrentSize != InvertedTable->MaxCount) {
-		if (CurrentSize != 0) {
-			while (Index < CurrentSize) {
-				if (ImageBase < InvertedTable->Entries[Index].ImageBase)break;
-				++Index;
-			}
-
-			if (Index != CurrentSize) {
-				RtlMoveMemory(&InvertedTable->Entries[Index + 1],
-					&InvertedTable->Entries[Index],
-					(CurrentSize - Index) * sizeof(RTL_INVERTED_FUNCTION_TABLE_ENTRY));
-			}
-		}
-
-		FunctionTable = (decltype(FunctionTable))RtlImageDirectoryEntryToData(ImageBase, TRUE, IMAGE_DIRECTORY_ENTRY_EXCEPTION, &SizeOfTable);
-		InvertedTable->Entries[Index].ExceptionDirectory = FunctionTable;
-		InvertedTable->Entries[Index].ImageBase = ImageBase;
-		InvertedTable->Entries[Index].ImageSize = SizeOfImage;
-		InvertedTable->Entries[Index].ExceptionDirectorySize = SizeOfTable;
-		InvertedTable->Count++;
-	}
-	else {
-		IsWin8OrGreater ? (InvertedTable->Overflow = TRUE) : (InvertedTable->Epoch = TRUE);
-	}
-
-#else
-	DWORD ptr, count;
-	bool IsWin8OrGreater = RtlIsWindowsVersionOrGreater(6, 2, 0);
-	ULONG Index = IsWin8OrGreater ? 1 : 0;
-
-	if (InvertedTable->Count == InvertedTable->MaxCount) {
-		if (IsWin8OrGreater)InvertedTable->NextEntrySEHandlerTableEncoded = TRUE;
-		else InvertedTable->Overflow = TRUE;
-		return;
-	}
-	while (Index < InvertedTable->Count) {
-		if (ImageBase < (IsWin8OrGreater ?
-			((PRTL_INVERTED_FUNCTION_TABLE_ENTRY_64)&InvertedTable->Entries[Index])->ImageBase :
-			InvertedTable->Entries[Index].ImageBase))
-			break;
-		Index++;
-	}
-	if (Index != InvertedTable->Count) {
-		if (IsWin8OrGreater) {
-			RtlMoveMemory(&InvertedTable->Entries[Index + 1], &InvertedTable->Entries[Index],
-				(InvertedTable->Count - Index) * sizeof(RTL_INVERTED_FUNCTION_TABLE_ENTRY));
-		}
-		else {
-			RtlMoveMemory(&InvertedTable->Entries[Index].NextEntrySEHandlerTableEncoded,
-				Index ? &InvertedTable->Entries[Index - 1].NextEntrySEHandlerTableEncoded : (PVOID)&InvertedTable->NextEntrySEHandlerTableEncoded,
-				(InvertedTable->Count - Index) * sizeof(RTL_INVERTED_FUNCTION_TABLE_ENTRY));
-		}
-	}
-
-	RtlCaptureImageExceptionValues(ImageBase, &ptr, &count);
-	if (IsWin8OrGreater) {
-		//memory layout is same as x64
-		PRTL_INVERTED_FUNCTION_TABLE_ENTRY_64 entry = (decltype(entry))&InvertedTable->Entries[Index];
-		entry->ExceptionDirectory = (PIMAGE_RUNTIME_FUNCTION_ENTRY)RtlEncodeSystemPointer((PVOID)ptr);
-		entry->ExceptionDirectorySize = count;
-		entry->ImageBase = ImageBase;
-		entry->ImageSize = SizeOfImage;
-	}
-	else {
-		if (Index) InvertedTable->Entries[Index - 1].NextEntrySEHandlerTableEncoded = RtlEncodeSystemPointer((PVOID)ptr);
-		else InvertedTable->NextEntrySEHandlerTableEncoded = (DWORD)RtlEncodeSystemPointer((PVOID)ptr);
-		InvertedTable->Entries[Index].ImageBase = ImageBase;
-		InvertedTable->Entries[Index].ImageSize = SizeOfImage;
-		InvertedTable->Entries[Index].SEHandlerCount = count;
-	}
-
-	++InvertedTable->Count;
-#endif
-	return;
-}
-
-static VOID RtlpRemoveInvertedFunctionTable(
-	_In_ PRTL_INVERTED_FUNCTION_TABLE InvertedTable,
-	_In_ PVOID ImageBase) {
-	ULONG CurrentSize;
-	ULONG Index;
-	//bool need = RtlIsWindowsVersionOrGreater(6, 2, 0);
-	bool IsWin8OrGreater = RtlIsWindowsVersionOrGreater(6, 2, 0);
-
-	CurrentSize = InvertedTable->Count;
-	for (Index = 0; Index < CurrentSize; Index += 1) {
-		if (ImageBase == (IsWin8OrGreater ?
-			((PRTL_INVERTED_FUNCTION_TABLE_ENTRY_64)&InvertedTable->Entries[Index])->ImageBase :
-			InvertedTable->Entries[Index].ImageBase))
-			break;
-	}
-
-	if (Index != CurrentSize) {
-		//if (need)_InterlockedIncrement(&InvertedTable->Epoch);
-		if (CurrentSize != 1) {
-#ifdef _WIN64
-			RtlMoveMemory(&InvertedTable->Entries[Index],
-				&InvertedTable->Entries[Index + 1],
-				(CurrentSize - Index - 1) * sizeof(RTL_INVERTED_FUNCTION_TABLE_ENTRY));
-#else
-			if (IsWin8OrGreater) {
-				RtlMoveMemory(&InvertedTable->Entries[Index], &InvertedTable->Entries[Index + 1],
-					(CurrentSize - Index) * sizeof(RTL_INVERTED_FUNCTION_TABLE_ENTRY));
-			}
-			else {
-				RtlMoveMemory(
-					Index ? &InvertedTable->Entries[Index - 1].NextEntrySEHandlerTableEncoded : (PVOID)&InvertedTable->NextEntrySEHandlerTableEncoded,
-					&InvertedTable->Entries[Index].NextEntrySEHandlerTableEncoded,
-					(CurrentSize - Index) * sizeof(RTL_INVERTED_FUNCTION_TABLE_ENTRY));
-			}
-#endif
-		}
-		InvertedTable->Count--;
-		//if (need)_InterlockedIncrement(&InvertedTable->Epoch);
-	}
-
-	if (InvertedTable->Count != InvertedTable->MaxCount) {
-		if (IsWin8OrGreater) {
-			PRTL_INVERTED_FUNCTION_TABLE_64(InvertedTable)->Overflow = FALSE;
-		}
-		else {
-			PRTL_INVERTED_FUNCTION_TABLE_WIN7_32(InvertedTable)->Overflow = FALSE;
-		}
-	}
-
-	return;
-}
-
-static NTSTATUS RtlProtectMrdata(_In_ ULONG Protect) {
-	static PVOID MrdataBase = nullptr;
-	static SIZE_T size = 0;
-	NTSTATUS status;
-	PVOID tmp;
-	SIZE_T tmp_len;
-	ULONG old;
-
-	if (!MrdataBase) {
-		MEMORY_BASIC_INFORMATION mbi{};
-		status = NtQueryVirtualMemory(GetCurrentProcess(), MmpGlobalDataPtr->MmpInvertedFunctionTable->LdrpInvertedFunctionTable, MemoryBasicInformation, &mbi, sizeof(mbi), nullptr);
-		if (!NT_SUCCESS(status))return status;
-		MrdataBase = mbi.BaseAddress;
-		size = mbi.RegionSize;
-	}
-
-	tmp = MrdataBase;
-	tmp_len = size;
-	return NtProtectVirtualMemory(GetCurrentProcess(), &tmp, &tmp_len, Protect, &old);
-}
-
-NTSTATUS NTAPI RtlInsertInvertedFunctionTable(
-	_In_ PVOID BaseAddress,
-	_In_ ULONG ImageSize) {
-	// The version check is a pure PEB read of a value fixed at process start, so
-	// keep it out of the lock. The table pointer lives in the global data that
-	// MmInitialize()/MmCleanup() publish and tear down under the loader lock, so
-	// read it under that same lock, together with the mutation it guards.
-	bool need_virtual_protect = RtlIsWindowsVersionOrGreater(6, 3, 0);
-	NTSTATUS status;
-
-	MmpLoaderLockGuard loaderLock;
-	if (loaderLock.Failed()) return STATUS_LOCK_NOT_GRANTED;
-
-	auto table = PRTL_INVERTED_FUNCTION_TABLE(MmpGlobalDataPtr->MmpInvertedFunctionTable->LdrpInvertedFunctionTable);
-	if (!table)return STATUS_NOT_SUPPORTED;
-
-	if (need_virtual_protect) {
-		status = RtlProtectMrdata(PAGE_READWRITE);
-		if (!NT_SUCCESS(status))return status;
-	}
-	RtlpInsertInvertedFunctionTable(table, BaseAddress, ImageSize);
-	if (need_virtual_protect) {
-		status = RtlProtectMrdata(PAGE_READONLY);
-		if (!NT_SUCCESS(status))return status;
-	}
-	return (RtlIsWindowsVersionOrGreater(6, 2, 0) ? PRTL_INVERTED_FUNCTION_TABLE_64(table)->Overflow : PRTL_INVERTED_FUNCTION_TABLE_WIN7_32(table)->Overflow) ?
-		STATUS_NO_MEMORY : STATUS_SUCCESS;
-}
-
-NTSTATUS NTAPI RtlRemoveInvertedFunctionTable(_In_ PVOID ImageBase) {
-	bool need_virtual_protect = RtlIsWindowsVersionOrGreater(6, 3, 0);
-	NTSTATUS status;
-
-	MmpLoaderLockGuard loaderLock;
-	if (loaderLock.Failed()) return STATUS_LOCK_NOT_GRANTED;
-
-	auto table = PRTL_INVERTED_FUNCTION_TABLE(MmpGlobalDataPtr->MmpInvertedFunctionTable->LdrpInvertedFunctionTable);
-	if (!table)return STATUS_NOT_SUPPORTED;
-
-	if (need_virtual_protect) {
-		status = RtlProtectMrdata(PAGE_READWRITE);
-		if (!NT_SUCCESS(status))return status;
-	}
-	RtlpRemoveInvertedFunctionTable(table, ImageBase);
-	if (need_virtual_protect) {
-		status = RtlProtectMrdata(PAGE_READONLY);
-		if (!NT_SUCCESS(status))return status;
-	}
-
-	return STATUS_SUCCESS;
-}
-
-//
-// LdrpInvertedFunctionTable is a fixed-size array inside ntdll's .mrdata, and
-// reaching it requires flipping that shared page writable and back with
-// RtlProtectMrdata(). ntdll flips the same page for its own inserts and
-// serializes that on a lock we cannot take, so our flip races its flip no matter
-// what we hold: we either write to a page ntdll just made read-only, or make it
-// read-only under ntdll's own write. Both were reproducible under
-// stress/stress.cpp as a crash in the RtlMoveMemory() shift or as a loader-wide
-// hang, identically with and without the loader lock.
-//
-// x64 has a documented way to do this that does not touch ntdll's internals at
-// all: RtlAddFunctionTable() publishes unwind info in ntdll's dynamic function
-// table, which RtlLookupFunctionEntry() consults for addresses that are not in
-// the inverted table, and which ntdll guards with its own lock. This is what
-// JITs use for generated code. It also has no fixed capacity, so it drops the
-// hard ceiling on concurrently loaded memory modules that the inverted table
-// imposes.
-//
-// x86 has no equivalent API, so it keeps the old path. That platform is not
-// built for shipping here and is left as it was rather than changed untested.
-//
 NTSTATUS NTAPI MmpRegisterExceptionTable(
 	_In_ PVOID BaseAddress,
 	_In_ ULONG ImageSize) {
-#ifdef _WIN64
 	UNREFERENCED_PARAMETER(ImageSize);
 
 	ULONG DirectorySize = 0;
@@ -274,13 +50,9 @@ NTSTATUS NTAPI MmpRegisterExceptionTable(
 	return RtlAddFunctionTable(FunctionTable,
 		DirectorySize / sizeof(RUNTIME_FUNCTION),
 		(DWORD64)BaseAddress) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
-#else
-	return RtlInsertInvertedFunctionTable(BaseAddress, ImageSize);
-#endif
 }
 
 NTSTATUS NTAPI MmpUnregisterExceptionTable(_In_ PVOID BaseAddress) {
-#ifdef _WIN64
 	ULONG DirectorySize = 0;
 	auto FunctionTable = (PRUNTIME_FUNCTION)RtlImageDirectoryEntryToData(
 		BaseAddress, TRUE, IMAGE_DIRECTORY_ENTRY_EXCEPTION, &DirectorySize);
@@ -296,12 +68,4 @@ NTSTATUS NTAPI MmpUnregisterExceptionTable(_In_ PVOID BaseAddress) {
 	// recompute from the still-mapped image rather than caching it.
 	//
 	return RtlDeleteFunctionTable(FunctionTable) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
-#else
-	return RtlRemoveInvertedFunctionTable(BaseAddress);
-#endif
 }
-
-//
-// Definition for the counter declared in LoaderPrivate.h.
-//
-extern "C" volatile LONG MmpLoaderLockAcquireFailures = 0;

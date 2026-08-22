@@ -164,15 +164,6 @@ BOOL NTAPI LdrpCallInitializers(PMEMORYMODULE module, DWORD dwReason) {
 	return TRUE;
 }
 
-#ifndef _WIN64
-SIZE_T NTAPI _RtlCompareMemory(
-	const VOID* Source1,
-	const VOID* Source2,
-	SIZE_T     Length) {
-	return decltype(&_RtlCompareMemory)(GetProcAddress((HMODULE)MmpGlobalDataPtr->MmpBaseAddressIndex->NtdllLdrEntry->DllBase, "RtlCompareMemory"))(Source1, Source2, Length);
-}
-#define RtlCompareMemory _RtlCompareMemory
-#endif
 
 NTSTATUS NTAPI RtlFindMemoryBlockFromModuleSection(
 	_In_ HMODULE ModuleHandle,
@@ -263,9 +254,6 @@ NTSTATUS NTAPI RtlFindMemoryBlockFromModuleSection(
 }
 
 
-#ifndef _WIN64
-#undef RtlCompareMemory
-#endif
 
 
 static WORD CalcCheckSum(DWORD StartValue, LPVOID BaseAddress, DWORD WordCount) {
@@ -411,32 +399,3 @@ BOOL NTAPI RtlIsWindowsVersionInScope(
 		!RtlIsWindowsVersionOrGreater(MaxMajorVersion, MaxMinorVersion, MaxBuildNumber);
 }
 
-#ifndef _WIN64
-int NTAPI RtlCaptureImageExceptionValues(PVOID BaseAddress, PDWORD SEHandlerTable, PDWORD SEHandlerCount) {
-	PIMAGE_LOAD_CONFIG_DIRECTORY pLoadConfigDirectory;
-	PIMAGE_COR20_HEADER pCor20;
-	ULONG Size;
-
-	//check if no seh
-	if (RtlImageNtHeader(BaseAddress)->OptionalHeader.DllCharacteristics & IMAGE_DLLCHARACTERISTICS_NO_SEH) {
-		*SEHandlerTable = *SEHandlerCount = -1;
-		return 0;
-	}
-
-	//get seh table and count
-	pLoadConfigDirectory = (decltype(pLoadConfigDirectory))RtlImageDirectoryEntryToData(BaseAddress, TRUE, IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, &Size);
-	if (pLoadConfigDirectory) {
-		if (Size == 0x40 && pLoadConfigDirectory->Size >= 0x48u) {
-			if (pLoadConfigDirectory->SEHandlerTable && pLoadConfigDirectory->SEHandlerCount) {
-				*SEHandlerTable = pLoadConfigDirectory->SEHandlerTable;
-				return *SEHandlerCount = pLoadConfigDirectory->SEHandlerCount;
-			}
-		}
-	}
-
-	//is .net core ?
-	pCor20 = (decltype(pCor20))RtlImageDirectoryEntryToData(BaseAddress, TRUE, IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR, &Size);
-	*SEHandlerTable = *SEHandlerCount = ((pCor20 && pCor20->Flags & 1) ? -1 : 0);
-	return 0;
-}
-#endif

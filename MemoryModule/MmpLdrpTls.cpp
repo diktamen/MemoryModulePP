@@ -17,41 +17,23 @@ static NTSTATUS NTAPI RtlFindLdrpHandleTlsDataOld() {
 		switch (MmpGlobalDataPtr->NtVersions.MinorVersion) {
 			//8.1
 		case 3: {
-#ifdef _WIN64
 			Size = 10;
 			OffsetOfFunctionBegin = 0x43;
 			Feature = "\x44\x8d\x43\x09\x4c\x8d\x4c\x24\x38";
-#else
-			Size = 8;
-			OffsetOfFunctionBegin = 0x1B;
-			Feature = "\x50\x6a\x09\x6a\x01\x8b\xc1";
-#endif
 			break;
 		}
 			  //8
 		case 2: {
-#ifdef _WIN64
 			Size = 9;
 			OffsetOfFunctionBegin = 0x49;
 			Feature = "\x48\x8b\x79\x30\x45\x8d\x66\x01";
-#else
-			Size = 7;
-			OffsetOfFunctionBegin = 0xC;
-			Feature = "\x8b\x45\x08\x89\x45\xa0";
-#endif
 			break;
 		}
 			  //7
 		case 1: {
-#ifdef _WIN64
 			Size = 12;
 			OffsetOfFunctionBegin = 0x27;
 			Feature = "\x41\xb8\x09\x00\x00\x00\x48\x8d\x44\x24\x38";
-#else
-			Size = 9;
-			OffsetOfFunctionBegin = 0x14;
-			Feature = "\x74\x20\x8d\x45\xd4\x50\x6a\x09";
-#endif
 			break;
 		}
 		default:return STATUS_NOT_SUPPORTED;
@@ -74,7 +56,6 @@ static NTSTATUS NTAPI RtlFindLdrpHandleTlsDataOld() {
 
 static NTSTATUS NTAPI RtlFindLdrpHandleTlsData10() {
 	LPVOID DllBase = MmpGlobalDataPtr->MmpBaseAddressIndex->NtdllLdrEntry->DllBase;
-#ifdef _WIN64
 	// search for LdrpHandleTls string literal
 	SEARCH_CONTEXT SearchContext{ SearchContext.SearchPattern = LPBYTE("LdrpHandleTlsData\x00"), SearchContext.PatternSize = 18 };
 	if (!NT_SUCCESS(RtlFindMemoryBlockFromModuleSection(HMODULE(DllBase), ".rdata", &SearchContext)))
@@ -135,9 +116,6 @@ static NTSTATUS NTAPI RtlFindLdrpHandleTlsData10() {
 	LdrpHandleTlsBlock++;
 	LdrpHandleTlsData = LdrpHandleTlsBlock;
 	return STATUS_SUCCESS;
-#else
-	return STATUS_NOT_SUPPORTED;
-#endif
 }
 
 static NTSTATUS NTAPI RtlFindLdrpHandleTlsData() {
@@ -159,12 +137,8 @@ static NTSTATUS NTAPI RtlFindLdrpReleaseTlsEntry() {
 	case 10: {
 		if (MmpGlobalDataPtr->NtVersions.MinorVersion) return STATUS_NOT_SUPPORTED;
 
-#ifdef _WIN64
 		Feature = "\x48\x89\x5c\x24\x08\x57\x48\x83\xec\x20\x48\x8b\xfa\x48\x8b\xd9\x48\x85\xd2\x75\x0c";
 		Size = 21;
-#else
-		return STATUS_NOT_SUPPORTED;
-#endif
 		break;
 	}
 	default:

@@ -3,13 +3,8 @@
 #include <cmath>
 
 #ifdef _USRDLL
-#if (defined(_WIN64) || defined(_M_ARM))
 #pragma comment(linker,"/export:LdrUnloadDllMemoryAndExitThread")
 #pragma comment(linker,"/export:FreeLibraryMemoryAndExitThread=LdrUnloadDllMemoryAndExitThread")
-#else
-#pragma comment(linker,"/export:LdrUnloadDllMemoryAndExitThread=_LdrUnloadDllMemoryAndExitThread@8")
-#pragma comment(linker,"/export:FreeLibraryMemoryAndExitThread=_LdrUnloadDllMemoryAndExitThread@8")
-#endif
 #endif
 
 NTSTATUS NTAPI LdrMapDllMemory(
@@ -473,3 +468,13 @@ NTSTATUS NTAPI LdrQuerySystemMemoryModuleFeatures(_Out_ PDWORD pFeatures) {
 	}
 	return status;
 }
+
+//
+// Definition for the counter declared in LoaderPrivate.h. It lives here because
+// this is where the loader lock is used; it was previously defined in
+// InvertedFunctionTable.cpp, which had nothing to do with it and which no longer
+// includes LoaderPrivate.h -- so the __declspec(dllexport) on the declaration
+// stopped being visible at the definition and the symbol quietly stopped being
+// exported. The harness caught that as "loaderlock acq failures: (not exported)".
+//
+extern "C" volatile LONG MmpLoaderLockAcquireFailures = 0;

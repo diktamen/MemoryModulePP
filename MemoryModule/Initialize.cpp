@@ -65,125 +65,6 @@ static __forceinline bool IsModuleUnloaded(PLDR_DATA_TABLE_ENTRY entry) {
 	}
 }
 
-#ifndef _WIN64
-PVOID FindLdrpInvertedFunctionTable32() {
-	// _RTL_INVERTED_FUNCTION_TABLE						x86
-	//		Count										+0x0	????????
-	//		MaxCount									+0x4	0x00000200
-	//		Overflow									+0x8	0x00000000(Win7) ????????(Win10)
-	//		NextEntrySEHandlerTableEncoded				+0xc	0x00000000(Win10) ++++++++(Win7)
-	// _RTL_INVERTED_FUNCTION_TABLE_ENTRY[0]			+0x10	ntdll.dll(win10) or The smallest base module
-	//		ImageBase									+0x10	++++++++
-	//		ImageSize									+0x14	++++++++
-	//		SEHandlerCount								+0x18	++++++++
-	//		NextEntrySEHandlerTableEncoded				+0x1c	++++++++(Win10) ????????(Win7)
-	//	_RTL_INVERTED_FUNCTION_TABLE_ENTRY[1] ...		...
-	// ......
-	HMODULE hModule = nullptr, hNtdll = GetModuleHandleW(L"ntdll.dll");
-	PIMAGE_NT_HEADERS NtdllHeaders = RtlImageNtHeader(hNtdll), ModuleHeaders = nullptr;
-	_RTL_INVERTED_FUNCTION_TABLE_ENTRY_WIN7_32 entry{};
-	LPCSTR lpSectionName = ".data";
-	SEARCH_CONTEXT SearchContext{ SearchContext.SearchPattern = (LPBYTE)&entry,SearchContext.PatternSize = sizeof(entry) };
-	PLIST_ENTRY ListHead = &NtCurrentPeb()->Ldr->InMemoryOrderModuleList,
-		ListEntry = ListHead->Flink;
-	PLDR_DATA_TABLE_ENTRY CurEntry = nullptr;
-	DWORD SEHTable, SEHCount;
-	BYTE Offset = 0x20;	//sizeof(_RTL_INVERTED_FUNCTION_TABLE_ENTRY)*2
-
-	if (RtlIsWindowsVersionOrGreater(6, 3, 0)) lpSectionName = ".mrdata";
-	else if (!RtlIsWindowsVersionOrGreater(6, 2, 0)) Offset = 0xC;
-
-	while (ListEntry != ListHead) {
-		CurEntry = CONTAINING_RECORD(ListEntry, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
-		ListEntry = ListEntry->Flink;
-		if (IsModuleUnloaded(CurEntry))continue;					//skip unloaded module
-		if (IsValidMemoryModuleHandle((HMEMORYMODULE)CurEntry->DllBase))continue;  //skip our memory module.
-		if (CurEntry->DllBase == hNtdll && Offset == 0x20)continue;	//Win10 skip first entry, if the base of ntdll is smallest.
-		hModule = (HMODULE)(hModule ? min(hModule, CurEntry->DllBase) : CurEntry->DllBase);
-	}
-	ModuleHeaders = RtlImageNtHeader(hModule);
-	if (!hModule || !ModuleHeaders || !hNtdll || !NtdllHeaders)return nullptr;
-
-	RtlCaptureImageExceptionValues(hModule, &SEHTable, &SEHCount);
-	entry = { RtlEncodeSystemPointer((PVOID)SEHTable),(DWORD)hModule,ModuleHeaders->OptionalHeader.SizeOfImage,(PVOID)SEHCount };
-
-	while (NT_SUCCESS(RtlFindMemoryBlockFromModuleSection(hNtdll, lpSectionName, &SearchContext))) {
-		PRTL_INVERTED_FUNCTION_TABLE_WIN7_32 tab = decltype(tab)(SearchContext.Result - Offset);
-
-		//Note: Same memory layout for RTL_INVERTED_FUNCTION_TABLE_ENTRY in Windows 10 x86 and x64.
-		if (RtlIsWindowsVersionOrGreater(6, 2, 0) && tab->MaxCount == 0x200 && !tab->NextEntrySEHandlerTableEncoded) return tab;
-		else if (tab->MaxCount == 0x200 && !tab->Overflow) return tab;
-	}
-
-	return nullptr;
-}
-
-#define FindLdrpInvertedFunctionTable FindLdrpInvertedFunctionTable32
-#else
-PVOID FindLdrpInvertedFunctionTable64() {
-	// _RTL_INVERTED_FUNCTION_TABLE						x64
-	//		Count										+0x0	????????
-	//		MaxCount									+0x4	0x00000200
-	//		Epoch										+0x8	????????
-	//		OverFlow									+0xc	0x00000000
-	// _RTL_INVERTED_FUNCTION_TABLE_ENTRY[0]			+0x10	ntdll.dll(win10) or The smallest base module
-	//		ExceptionDirectory							+0x10	++++++++
-	//		ImageBase									+0x18	++++++++
-	//		ImageSize									+0x20	++++++++
-	//		ExceptionDirectorySize						+0x24	++++++++
-	//	_RTL_INVERTED_FUNCTION_TABLE_ENTRY[1] ...		...
-	// ......
-	HMODULE hModule = nullptr, hNtdll = GetModuleHandleW(L"ntdll.dll");
-	PIMAGE_NT_HEADERS NtdllHeaders = RtlImageNtHeader(hNtdll), ModuleHeaders = nullptr;
-	_RTL_INVERTED_FUNCTION_TABLE_ENTRY_64 entry{};
-	LPCSTR lpSectionName = ".data";
-	PIMAGE_DATA_DIRECTORY dir = nullptr;
-	SEARCH_CONTEXT SearchContext{ SearchContext.SearchPattern = (LPBYTE)&entry,SearchContext.PatternSize = sizeof(entry) };
-
-	//Windows 8
-	if (RtlVerifyVersion(6, 2, 0, RTL_VERIFY_FLAGS_MAJOR_VERSION | RTL_VERIFY_FLAGS_MINOR_VERSION)) {
-		hModule = hNtdll;
-		ModuleHeaders = NtdllHeaders;
-		//lpSectionName = ".data";
-	}
-	//Windows 8.1 ~ Windows 10
-	else if (RtlIsWindowsVersionOrGreater(6, 3, 0)) {
-		hModule = hNtdll;
-		ModuleHeaders = NtdllHeaders;
-		lpSectionName = ".mrdata";
-	}
-	else {
-		PLIST_ENTRY ListHead = &NtCurrentPeb()->Ldr->InLoadOrderModuleList,
-			ListEntry = ListHead->Flink;
-		PLDR_DATA_TABLE_ENTRY CurEntry = nullptr;
-		while (ListEntry != ListHead) {
-			CurEntry = CONTAINING_RECORD(ListEntry, LDR_DATA_TABLE_ENTRY, InLoadOrderLinks);
-			ListEntry = ListEntry->Flink;
-			//Make sure the smallest base address is not our memory module
-			if (IsValidMemoryModuleHandle((HMEMORYMODULE)CurEntry->DllBase))continue;
-			hModule = (HMODULE)(hModule ? min(hModule, CurEntry->DllBase) : CurEntry->DllBase);
-		}
-		ModuleHeaders = RtlImageNtHeader(hModule);
-	}
-
-	if (!hModule || !ModuleHeaders || !hNtdll || !NtdllHeaders)return nullptr;
-	dir = &ModuleHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
-	entry = {
-		dir->Size ? decltype(entry.ExceptionDirectory)((size_t)hModule + dir->VirtualAddress) : nullptr ,
-		(PVOID)hModule, ModuleHeaders->OptionalHeader.SizeOfImage,dir->Size
-	};
-
-	while (NT_SUCCESS(RtlFindMemoryBlockFromModuleSection(hNtdll, lpSectionName, &SearchContext))) {
-		PRTL_INVERTED_FUNCTION_TABLE_64 tab = decltype(tab)(SearchContext.Result - 0x10);
-		if (RtlIsWindowsVersionOrGreater(6, 2, 0) && tab->MaxCount == 0x200 && !tab->Overflow) return tab;
-		else if (tab->MaxCount == 0x200 && !tab->Epoch) return tab;
-	}
-
-	return nullptr;
-}
-
-#define FindLdrpInvertedFunctionTable FindLdrpInvertedFunctionTable64
-#endif
 
 BOOL IsValidLdrpHashTable(PLIST_ENTRY LdrpHashTable) {
 
@@ -555,27 +436,17 @@ NTSTATUS InitializeLockHeld() {
 		MmpGlobalDataPtr->MmpBaseAddressIndex->_RtlRbRemoveNode = GetProcAddress((HMODULE)pNtdllEntry->DllBase, "RtlRbRemoveNode");
 
 		//
-		// Only x86 still reaches LdrpInvertedFunctionTable. Since ReflectiveMapDll
-		// moved to MmpRegisterExceptionTable there is no caller of it on 64-bit at
-		// all, so scanning for it there is pure downside: a wrong hit sets a
-		// feature bit and hands out an address nothing should use, while a right
-		// one buys nothing. On x86 MmpRegisterExceptionTable still falls back to
-		// the inverted table, so keep looking there.
+		// LdrpInvertedFunctionTable is no longer located at all. Unwind info is
+		// published through RtlAddFunctionTable, which needs nothing from ntdll's
+		// internals, and with x86 support removed there is no caller left for the
+		// inverted table. The feature bit stays defined for ABI compatibility but
+		// is never set; MEMORY_FEATURE_ALL callers should not expect it.
 		//
-		// The scan itself is a byte pattern with hardcoded struct offsets and a
-		// hardcoded MaxCount of 0x200; stress/probe_ift.cpp derives all of those
-		// instead and confirms the constants are right on every build measured.
-		//
-#ifndef _WIN64
-		MmpGlobalDataPtr->MmpInvertedFunctionTable->LdrpInvertedFunctionTable = FindLdrpInvertedFunctionTable();
-#else
 		MmpGlobalDataPtr->MmpInvertedFunctionTable->LdrpInvertedFunctionTable = nullptr;
-#endif
 
         MmpGlobalDataPtr->MmpFeatures = MEMORY_FEATURE_SUPPORT_VERSION | MEMORY_FEATURE_LDRP_HEAP | MEMORY_FEATURE_LDRP_HANDLE_TLS_DATA | MEMORY_FEATURE_LDRP_RELEASE_TLS_ENTRY;
         if (MmpGlobalDataPtr->MmpBaseAddressIndex->LdrpModuleBaseAddressIndex)MmpGlobalDataPtr->MmpFeatures |= MEMORY_FEATURE_MODULE_BASEADDRESS_INDEX;
         if (MmpGlobalDataPtr->MmpLdrEntry->LdrpHashTable)MmpGlobalDataPtr->MmpFeatures |= MEMORY_FEATURE_LDRP_HASH_TABLE;
-        if (MmpGlobalDataPtr->MmpInvertedFunctionTable->LdrpInvertedFunctionTable)MmpGlobalDataPtr->MmpFeatures |= MEMORY_FEATURE_INVERTED_FUNCTION_TABLE;
 
 		MmpGlobalDataPtr->MmpFunctions->_LdrLoadDllMemoryExW = LdrLoadDllMemoryExW;
 		MmpGlobalDataPtr->MmpFunctions->_LdrUnloadDllMemory = LdrUnloadDllMemory;

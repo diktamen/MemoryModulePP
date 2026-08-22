@@ -1,70 +1,21 @@
 #pragma once
 
-typedef struct _RTL_INVERTED_FUNCTION_TABLE_ENTRY_64 {
-	PIMAGE_RUNTIME_FUNCTION_ENTRY ExceptionDirectory;
-	PVOID ImageBase;
-	ULONG ImageSize;
-	ULONG ExceptionDirectorySize;
-} RTL_INVERTED_FUNCTION_TABLE_ENTRY_64, * PRTL_INVERTED_FUNCTION_TABLE_ENTRY_64;
-typedef struct _RTL_INVERTED_FUNCTION_TABLE_64 {
-	ULONG Count;
-	ULONG MaxCount;
-	ULONG Epoch;
-	ULONG Overflow;
-	RTL_INVERTED_FUNCTION_TABLE_ENTRY_64 Entries[0x200];
-} RTL_INVERTED_FUNCTION_TABLE_64, * PRTL_INVERTED_FUNCTION_TABLE_64;
-
-//	The correct data structure should be this.
-//
-//typedef struct _RTL_INVERTED_FUNCTION_TABLE_ENTRY_WIN7_32 {
-//  PVOID EntrySEHandlerTableEncoded;
-//	PVOID ImageBase;
-//	ULONG ImageSize;
-//	ULONG SEHandlerCount;
-//} RTL_INVERTED_FUNCTION_TABLE_ENTRY_WIN7_32, * PRTL_INVERTED_FUNCTION_TABLE_ENTRY_WIN7_32;
-//typedef struct _RTL_INVERTED_FUNCTION_TABLE_WIN7_32 {
-//	ULONG Count;
-//	ULONG MaxCount;
-//	ULONG Overflow;
-//	RTL_INVERTED_FUNCTION_TABLE_ENTRY_WIN7_32 Entries[0x200];
-//} RTL_INVERTED_FUNCTION_TABLE_WIN7_32, * PRTL_INVERTED_FUNCTION_TABLE_WIN7_32;
-//
-//
-typedef struct _RTL_INVERTED_FUNCTION_TABLE_ENTRY_WIN7_32 {
-	PVOID ImageBase;
-	ULONG ImageSize;
-	ULONG SEHandlerCount;
-	PVOID NextEntrySEHandlerTableEncoded;
-} RTL_INVERTED_FUNCTION_TABLE_ENTRY_WIN7_32, * PRTL_INVERTED_FUNCTION_TABLE_ENTRY_WIN7_32;
-typedef struct _RTL_INVERTED_FUNCTION_TABLE_WIN7_32 {
-	ULONG Count;
-	ULONG MaxCount;
-	ULONG Overflow;
-	ULONG NextEntrySEHandlerTableEncoded;
-	RTL_INVERTED_FUNCTION_TABLE_ENTRY_WIN7_32 Entries[0x200];
-} RTL_INVERTED_FUNCTION_TABLE_WIN7_32, * PRTL_INVERTED_FUNCTION_TABLE_WIN7_32;
-
-#ifdef _WIN64
-typedef _RTL_INVERTED_FUNCTION_TABLE_ENTRY_64 _RTL_INVERTED_FUNCTION_TABLE_ENTRY, RTL_INVERTED_FUNCTION_TABLE_ENTRY, * PRTL_INVERTED_FUNCTION_TABLE_ENTRY;
-typedef RTL_INVERTED_FUNCTION_TABLE_64 _RTL_INVERTED_FUNCTION_TABLE, RTL_INVERTED_FUNCTION_TABLE, * PRTL_INVERTED_FUNCTION_TABLE;
-#else
-typedef RTL_INVERTED_FUNCTION_TABLE_WIN7_32 _RTL_INVERTED_FUNCTION_TABLE, RTL_INVERTED_FUNCTION_TABLE, * PRTL_INVERTED_FUNCTION_TABLE;
-typedef _RTL_INVERTED_FUNCTION_TABLE_ENTRY_WIN7_32 _RTL_INVERTED_FUNCTION_TABLE_ENTRY, RTL_INVERTED_FUNCTION_TABLE_ENTRY, * PRTL_INVERTED_FUNCTION_TABLE_ENTRY;
-#endif
-
-NTSTATUS NTAPI RtlInsertInvertedFunctionTable(
-	_In_ PVOID BaseAddress,
-	_In_ ULONG ImageSize
-);
-
-NTSTATUS NTAPI RtlRemoveInvertedFunctionTable(_In_ PVOID ImageBase);
-
 //
 // Make a memory module's unwind info visible to RtlLookupFunctionEntry, and undo
-// it. On x64 these use ntdll's documented dynamic function table
-// (RtlAddFunctionTable/RtlDeleteFunctionTable), which ntdll serializes itself.
-// On x86 there is no such API and they fall back to editing
-// LdrpInvertedFunctionTable directly.
+// it.
+//
+// These use ntdll's documented dynamic function table --
+// RtlAddFunctionTable/RtlDeleteFunctionTable -- which ntdll guards with its own
+// lock, has no fixed capacity, and is what JITs use for generated code.
+//
+// They used to have a second implementation that edited ntdll's
+// LdrpInvertedFunctionTable directly, for x86, which has no such API. That is
+// gone along with the rest of the x86 support, and with it the whole
+// LdrpInvertedFunctionTable apparatus: locating the table by byte pattern with
+// hardcoded struct offsets and a hardcoded MaxCount of 0x200, the RtlProtectMrdata
+// page flip whose race against ntdll's own flip could not be closed by any lock
+// we could take, and the hard ceiling that fixed-size table put on the number of
+// concurrently loaded memory modules.
 //
 NTSTATUS NTAPI MmpRegisterExceptionTable(
 	_In_ PVOID BaseAddress,

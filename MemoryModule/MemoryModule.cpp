@@ -2,12 +2,8 @@
 
 #if defined(_M_ARM64)
 #define HOST_MACHINE IMAGE_FILE_MACHINE_ARM64
-#elif defined(_M_ARM)
-#define HOST_MACHINE IMAGE_FILE_MACHINE_ARM
-#elif defined(_WIN64)
-#define HOST_MACHINE IMAGE_FILE_MACHINE_AMD64
 #else
-#define HOST_MACHINE IMAGE_FILE_MACHINE_I386
+#define HOST_MACHINE IMAGE_FILE_MACHINE_AMD64
 #endif
 
 #define GET_HEADER_DICTIONARY(headers, idx)  &headers->OptionalHeader.DataDirectory[idx]

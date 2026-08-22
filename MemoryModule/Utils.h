@@ -74,7 +74,3 @@ BOOL NTAPI RtlIsWindowsVersionInScope(
 	_In_ DWORD MaxMinorVersion,
 	_In_ DWORD MaxBuildNumber
 );
-
-#ifndef _WIN64
-int NTAPI RtlCaptureImageExceptionValues(PVOID BaseAddress, PDWORD SEHandlerTable, PDWORD SEHandlerCount);
-#endif
