@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "NtdllTls.h"
+#include "arm64ec_thunk.h"
 
 extern "C" volatile LONG MmpTlsLocated = 0;
 extern "C" volatile LONG MmpTlsHandleRva = 0;
@@ -597,8 +598,10 @@ static ULONG MmpParentsFromUnwind(_In_ ULONG Funclet, ULONG* Out, _In_ ULONG Max
 // an entry thunk. Exported functions have one; ntdll's internal loader helpers do
 // not. An emulated x64 caller needs that thunk to reach ARM64 code, and calling
 // without it does not fault -- the emulator ends the process with
-// STATUS_WX86_INTERNAL_ERROR, with no first-chance exception dispatched. So this
-// has to be checked and refused, never attempted and caught.
+// STATUS_WX86_INTERNAL_ERROR, with no first-chance exception dispatched. So a
+// thunkless target must never be called blind: either lend it a signature-
+// compatible entry thunk for the call (arm64ec_thunk.*), or, when that borrow is
+// unavailable, refuse. It is never attempted and caught.
 //
 static BOOLEAN MmpCallableFromHere(_In_ ULONG Rva) {
 	MMP_FLAVOUR fl = MmpFlavourOf(Rva);
@@ -609,7 +612,15 @@ static BOOLEAN MmpCallableFromHere(_In_ ULONG Rva) {
 	if (fl == MMP_FL_ARM64EC) {
 		if (Rva < 4) return FALSE;
 		ULONG tag = *(const ULONG*)(MmpNt + Rva - 4);
-		return (tag & 3) == 1;
+		if ((tag & 3) == 1) return TRUE;                        // has its own entry thunk
+		//
+		// Thunkless internal helper. Historically refused here. It is now reachable
+		// by temporarily lending it a signature-compatible entry thunk for the
+		// duration of one call (see arm64ec_thunk.*); the actual calls in
+		// MmpLdrpTls.cpp go through EcCall*, which performs that borrow. Only accept
+		// it when the borrow is actually available, else keep refusing.
+		//
+		return Arm64ecBorrowReady() ? TRUE : FALSE;
 	}
 	return TRUE;
 #else
@@ -677,6 +688,44 @@ static ULONG MmpLocateHandleTlsData(_Out_ ULONG* Agreement) {
 }
 
 //
+// Follow an export's ARM64EC fast-forward sequence to its EC body. In an emulated
+// x64 process GetProcAddress hands back the x64 FFS thunk, but EC code inside
+// ntdll calls the EC body directly, so the callee matching below has to compare
+// against the body or it never matches. A no-op on genuine x64 and native ARM64,
+// where the export address already is the code that runs.
+//
+static PVOID MmpEcBodyOf(_In_opt_ PVOID Export) {
+	//
+	// Only an emulated x64 caller on an ARM64X image is handed a thunk instead of
+	// the code that runs. Everywhere else the export address is already the body,
+	// so decoding is at best a no-op and at worst a byte pattern matching by
+	// accident -- this keeps the change inert on the two configurations that
+	// already worked.
+	//
+	if (MmpOurFlavour != MMP_FL_ARM64EC) return Export;
+
+	const UCHAR* b = (const UCHAR*)Export;
+	if (!b || b < MmpNt || (SIZE_T)(b - MmpNt) + 14 > MmpNtSize) return Export;
+	if (b[0] == 0xFF && b[1] == 0x25) {                          // jmp qword[rip+disp32]
+		LONG d = *(const LONG*)(b + 2);
+		const UCHAR* slot = b + 6 + d;
+		if (slot >= MmpNt && slot + 8 <= MmpNt + MmpNtSize) {
+			const UCHAR* t = *(const UCHAR* const*)slot;
+			if (t >= MmpNt && (SIZE_T)(t - MmpNt) < MmpNtSize) return (PVOID)t;
+		}
+		return Export;
+	}
+	if (b[9] == 0xE9 &&                                          // <9-byte prologue> jmp rel32
+		((b[0] == 0x48 && b[1] == 0x8B && b[2] == 0xC4) ||
+		 (b[0] == 0x48 && b[1] == 0x8B && b[2] == 0xFF))) {
+		LONG rel = *(const LONG*)(b + 10);
+		const UCHAR* t = b + 14 + rel;
+		if (t >= MmpNt && (SIZE_T)(t - MmpNt) < MmpNtSize) return (PVOID)t;
+	}
+	return Export;
+}
+
+//
 // LdrpReleaseTlsEntry has no name literal anywhere in ntdll, so it is selected
 // from LdrpHandleTlsData's direct callees -- it is called on the error path after
 // a TLS entry has been allocated. Discriminators: it frees (calls the exported
@@ -684,8 +733,8 @@ static ULONG MmpLocateHandleTlsData(_Out_ ULONG* Agreement) {
 // to be unique; anything else returns nothing.
 //
 static ULONG MmpLocateReleaseTlsEntry(_In_ HMODULE Ntdll, _In_ ULONG HandleRva) {
-	PVOID freeHeap = GetProcAddress(Ntdll, "RtlFreeHeap");
-	PVOID allocHeap = GetProcAddress(Ntdll, "RtlAllocateHeap");
+	PVOID freeHeap = MmpEcBodyOf(GetProcAddress(Ntdll, "RtlFreeHeap"));
+	PVOID allocHeap = MmpEcBodyOf(GetProcAddress(Ntdll, "RtlAllocateHeap"));
 	if (!freeHeap || !allocHeap) return 0;
 
 	//

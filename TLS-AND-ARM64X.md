@@ -1,5 +1,12 @@
 # TLS for memory-loaded modules, and why ARM64X is different
 
+> **Status: solved.** x64-on-ARM64X now runs TLS through ntdll's own helpers like
+> every other configuration -- `features 0x67`, `tls-handle=ON`, measured on
+> Win11 26200 / ntdll 10.0.26100.8972. The analysis below is still accurate as
+> background, but the conclusion it reaches -- that the call must be refused --
+> no longer holds. See **Resolution** before acting on anything in
+> "Options for x64-on-ARM64X", which is kept only as history.
+
 ## What is needed
 
 A DLL with `thread_local` data carries a TLS directory. When the OS loader maps
@@ -108,7 +115,106 @@ locator was an x64 byte signature that found nothing in an ARM64X ntdll, so the
 call was never attempted. A locator that worked without a callability check would
 have converted a silent no-op into an undiagnosable process kill.
 
-## Options for x64-on-ARM64X
+## Resolution: borrow an entry thunk
+
+The blank in the appendix has an answer, and it comes from two facts about the
+ABI rather than from anything clever:
+
+* **Entry thunks are per-signature, not per-function.** Microsoft's ABI notes are
+  explicit: they are "not unique for each Arm64EC function; rather, they are
+  unique per call signature." One thunk serves every function of the same shape.
+* **The emulator passes the real target in `x9`.** The thunk marshals x64
+  registers into the ARM64 ABI and then calls whatever `x9` points at, so it does
+  not care which function it is thunking for.
+
+So the only thing `LdrpHandleTlsData` lacks is the four-byte tag at `fn-4`. A
+signature-compatible thunk for it already exists in ntdll, emitted for the
+exported functions that share its signature. Lend it one:
+
+```
+tag = ((donorThunkVa - fnVa) & ~3) | 1
+```
+
+`NTSTATUS f(void*)` borrows from `RtlDeleteCriticalSection`;
+`NTSTATUS f(void*, void**)` from `RtlInitUnicodeStringEx`. Both are resolved at
+runtime by decoding the export's fast-forward sequence to its EC body and reading
+that body's own tag, with fallback donors in case one is inline-hooked.
+
+This is "synthesize an entry thunk" answered in the one way the earlier note did
+not consider: **nothing is synthesized and no code is written.** The thunk is
+ntdll's own, already present and already correct. What changes is one dword of
+metadata in a slot that was zero, in this process's copy-on-write copy of the
+page. No code byte is modified, and nothing is written to disk.
+
+Two things about the patch are load-bearing under concurrency, and both were
+found by the stress harness rather than by reasoning:
+
+* **Keep the page executable.** `VirtualProtect` acts on whole pages, and
+  `fn-4` shares its page with the function itself (`0x2186FC` and `0x218700`
+  here). `PAGE_READWRITE` strips execute from all of it, and any other thread
+  running code on that page in that window takes a DEP fault reported at its own
+  instruction pointer -- which reads exactly like a wild jump and is nothing of
+  the kind. `PAGE_EXECUTE_READWRITE` avoids it.
+* **Patch once, do not restore.** Restoring after each call reopens a window in
+  which the tag is zero, and a thread transitioning during that window is killed
+  uncatchably. The tag is left in place for the life of the process.
+
+Implementation is `MemoryModule/arm64ec_thunk.{h,cpp}`; `NtdllTls.cpp` accepts a
+thunkless EC body only when `Arm64ecBorrowReady()` says a donor was resolved, and
+otherwise still refuses. `MmpLdrpTls.cpp` routes the two calls through
+`EcCallHandleTlsData` / `EcCallReleaseTlsEntry`, which are a plain direct call on
+genuine x64 and native ARM64.
+
+One further defect surfaced once the gate stopped refusing: the release locator
+matches callees against `RtlFreeHeap` and `RtlAllocateHeap` from `GetProcAddress`,
+which under emulation hands back the x64 fast-forward stub rather than the EC body
+that EC code actually calls. Nothing matched, so `LdrpReleaseTlsEntry` was never
+found. `MmpEcBodyOf` decodes those two exports to their EC bodies first, and is a
+no-op unless this process reaches ntdll through the ARM64EC view.
+
+### Measured
+
+```
+x64 on ARM64X   features 0x67  tls-handle=ON tls-release=ON
+                ntdll tls: located  handle=ntdll+0x218700 release=ntdll+0x218F70  anchors=2
+```
+
+Stress harness, Win11 26200, Apple Silicon:
+
+| run | result |
+| --- | --- |
+| mixed / same / distinct, 1600 loads each | PASS, zero failures of any kind |
+| 12 threads x 600 iters = 7,200 load/unload | PASS, zero failures |
+| native ARM64 regression, 1600 loads | PASS, `+0xD2270 / +0xD2D18`, unchanged |
+
+Both configurations that already worked were re-measured with the same binaries,
+and neither moved. Genuine x64 (Server 2022 20348, Xeon W-2295):
+
+| run | result |
+| --- | --- |
+| mixed / same / distinct, 1600 loads each | PASS, `+0x35BF0 / +0x82394`, unchanged |
+| 12 threads x 2000 iters = 24,000 load/unload | PASS, zero failures |
+
+`MmpEcBodyOf` is gated on the ARM64EC view, so on both of those it is never
+entered -- the locator reaches the same addresses by the same path it always did,
+which is what the unchanged RVAs above confirm.
+
+TLS indices were checked directly rather than inferred: 16 concurrent memory
+modules receive 16 distinct indices (7..22), and after unloading all of them the
+next 16 receive the same set again -- so the release path frees the bitmap bits
+and nothing leaks. Those loads pass **no** `LOAD_FLAGS_NOT_FAIL_IF_HANDLE_TLS`,
+so they only succeed if TLS handling actually ran.
+
+### What to watch
+
+The tag write lands in ntdll's `.text` page. It survived ~10,000 calls here
+without Defender objecting, but a `.text` write is what anti-tamper and EDR
+agents watch most closely, so it is worth one run against the real field agent
+stack. If that ever becomes untenable, the fallback is to enroll the module in
+`LdrpTlsList` directly -- it writes ntdll `.data` instead and calls nothing, at
+the cost of modelling three undocumented globals per Windows build.
+
+## Options for x64-on-ARM64X (historical -- superseded by Resolution above)
 
 1. **Ship a native ARM64 build.** TLS works there. Best answer where it is
    available.

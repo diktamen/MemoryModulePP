@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "arm64ec_thunk.h"
 
 #if (!MMPP_USE_TLS)
 
@@ -218,6 +219,10 @@ NTSTATUS NTAPI MmpReleaseTlsEntry(_In_ PLDR_DATA_TABLE_ENTRY lpModuleEntry) {
 	fp.ptr = LdrpReleaseTlsEntry;
 
 	if (fp.ptr) {
+		// Emulated x64 on ARM64X: the located address is a thunkless ARM64EC body;
+		// reach it through a borrowed entry thunk. Native x64/ARM64 call directly.
+		if (Arm64ecEmulationActive())
+			return EcCallReleaseTlsEntry(fp.ptr, lpModuleEntry, nullptr);
 		return stdcall ? fp.stdcall(lpModuleEntry, nullptr) : fp.thiscall(lpModuleEntry, nullptr);
 	}
 	else {
@@ -243,6 +248,10 @@ NTSTATUS NTAPI MmpHandleTlsData(_In_ PLDR_DATA_TABLE_ENTRY lpModuleEntry) {
 	fp.ptr = LdrpHandleTlsData;
 
 	if (fp.ptr) {
+		// Emulated x64 on ARM64X: the located address is a thunkless ARM64EC body;
+		// reach it through a borrowed entry thunk. Native x64/ARM64 call directly.
+		if (Arm64ecEmulationActive())
+			return EcCallHandleTlsData(fp.ptr, lpModuleEntry);
 		return stdcall ? fp.stdcall(lpModuleEntry) : fp.thiscall(lpModuleEntry);
 	}
 	else {
