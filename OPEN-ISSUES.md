@@ -392,9 +392,52 @@ Three distinct problems in `BaseAddressIndex.cpp` and its caller:
    arm64, 2 on x64 under emulation, 2 on genuine x64, all exit `0` with zero
    load, unload and integrity failures.
 
-Also: index discovery is skipped unless ntdll's tree root happens to be black, so
-on some runs the capability is silently absent and every memory load fails.
-Nondeterministic, and it will look like a flaky bug.
+### Index discovery raced the loader — FIXED, and the stated cause was wrong
+
+This file used to say discovery "is skipped unless ntdll's tree root happens to
+be black". That is not what was going wrong. Driving ntdll's own exported
+`RtlRbInsertNodeEx`/`RtlRbRemoveNode` over 200,255 operations and sampling the
+root colour after each produced **zero red roots on all three ntdll builds** —
+ntdll keeps the classic root-is-black invariant, so on a settled tree the gate
+could never fire.
+
+The real defect: `FindLdrpModuleBaseAddressIndex()` climbs from ntdll's node to
+the tree root by following `ParentValue`, and it ran **with no loader-database
+lock at all** — which was not merely omitted but impossible, because
+`MmpInitializeModuleDatatableLock()` was called *thirteen lines further down*.
+Any concurrent load rebalancing the tree could send that climb onto a stale node
+whose address is nowhere in `.data`, which reads as "not found", clears
+`MEMORY_FEATURE_MODULE_BASEADDRESS_INDEX`, and silently fails every memory load
+for the life of the process.
+
+Measured under contention, three threads churning `LoadLibrary`/`FreeLibrary`:
+
+| | red root observed | discovery failures |
+| --- | --- | --- |
+| native ARM64 | 0 in 1.48 × 10⁹ samples | 7 / 48,000 = 0.015 % |
+| x64 under ARM64X | 0 in 0.80 × 10⁹ samples | 1 / 9,000 = 0.011 % |
+| genuine x64, 3 cores | 334 in 1.87 × 10⁹ | **71 / 4,500 = 1.58 %** |
+
+Every failure was a stale climb (`no hit`), never the colour gate. The red roots
+that *do* appear on real x64 are torn reads produced by the same missing lock.
+
+Fixed by locating the lock first and holding it across the whole discovery — the
+module-list walk that finds ntdll's entry, the climb to the root, and the hash
+table walk, as one acquisition rather than three, since a per-step lock would
+still be a time-of-check race. The colour gate is deleted: with the climb stable
+it says nothing worth acting on, and when it fired it was detecting a symptom of
+the missing lock while paying for it by disabling the capability outright.
+
+`GetProcAddress` for `RtlRbInsertNodeEx`/`RtlRbRemoveNode` stays *outside* that
+section deliberately — it enters ntdll's loader, which takes the same lock, and
+an SRW lock is not recursive.
+
+**Still not done:** the `.data` byte scan is unchanged, so the address is still
+accepted on a single unaligned byte match with no reconciliation against
+`PEB->Ldr`. `stress/probe_baseindex.cpp` shows the stronger form — pointer-aligned
+`{Root, Min}` scan over all writable sections, then set-equality and ordering
+checks against the module list, then a behavioural load/free — and reports
+25/25 deterministic on every configuration.
 
 ---
 
