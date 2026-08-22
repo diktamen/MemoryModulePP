@@ -1,4 +1,12 @@
 #include "stdafx.h"
+
+//
+// Only reachable from MmpTls.cpp, which is itself compiled out unless
+// MMPP_USE_TLS is set. Guarded so it compiles to nothing in the default build:
+// it owns a CRITICAL_SECTION whose only initializer lives in MmpTls.cpp, so in
+// the default build the section was present, uninitialized, and unreachable.
+//
+#if (MMPP_USE_TLS)
 #include "MmpTlsp.h"
 #include "MmpTlsFiber.h"
 
@@ -139,3 +147,5 @@ VOID MmpTlsFiberInitialize() {
 
 	CreateThread(nullptr, 0, MmpReleasePostponedTlsWorker_Wrap, nullptr, 0, nullptr);
 }
+
+#endif

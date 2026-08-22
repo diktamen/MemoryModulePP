@@ -2,74 +2,25 @@
 
 What is actually still wrong, or still unproven, in MemoryModulePP.
 
-`OPEN-ISSUES.md` is the historical record: most of what it lists has since been
-fixed, and several of its diagnoses turned out to be wrong in instructive ways.
-It is worth reading for *why* things are the way they are — but read this file
-for what to worry about now.
+`OPEN-ISSUES.md` is the historical record: everything it lists has now been fixed
+or superseded, and several of its diagnoses turned out to be wrong in instructive
+ways. Read it for *why* things are the way they are; read this file for what to
+worry about now.
 
 Ordered by how likely each is to bite in production.
 
 ---
 
-## 1. TLS on ARM64 — FIXED. The ARM64X-x64 case is a platform limit.
+## 1. No TLS for x64 processes on ARM64 hardware
 
-**Status:** ARM64 now has real TLS for the first time. x64-under-ARM64X refuses
-by design, which is the correct answer rather than a gap.
+**Status:** open, and a platform limit rather than a bug. This is the one that
+matters for an x64 JDK on an ARM64 machine.
 
-The old locators were x64 byte signatures, and one of them was compiled under
-`#ifdef _WIN64` — **which is defined for ARM64 too** — so an ARM64 build searched
-ARM64 `.text` for x64 machine code. Byte-scanned directly: 1 hit on Server 2022
-x64 (correct), 0 hits in the ARM64X ntdll. When either scan missed,
-`MmpTlsInitialize()` nulled *both* pointers, cleared the feature bit after having
-set it, and returned FALSE into a caller that discards it — and the load then
-succeeded anyway because callers pass `LOAD_FLAGS_NOT_FAIL_IF_HANDLE_TLS`. Every
-memory-loaded module on ARM64 ran with no TLS at all, reporting `PASS`.
-
-`MemoryModule/NtdllTls.cpp` replaces both with an ABI-driven locator:
-
-- **`LdrpHandleTlsData`** — ntdll logs its own name, so the literal sits in
-  read-only data. Find every reference to it from executable code accepting *any*
-  destination register on x64 and `adrp`+`add` on ARM64 (the old scan hardcoded
-  `lea rdx`, which is most of why it found nothing elsewhere). The reference is
-  inside an exception filter funclet; `RtlLookupFunctionEntry` — exported, and on
-  ARM64X already aware which function table applies to this view — turns it into
-  the funclet's start. Then recover the parent **two independent ways**, from the
-  validated scope record in read-only data and by walking every function's own
-  unwind data, and require both to agree.
-- **`LdrpReleaseTlsEntry`** — has no name literal anywhere in ntdll, so it is
-  selected from `LdrpHandleTlsData`'s direct callees (it is called on the error
-  path) by requiring that it calls the exported `RtlFreeHeap`, never calls
-  `RtlAllocateHeap`, and is small. The winner must be unique.
-- **ARM64EC gate** — applied before anything is called.
-
-Measured, with every address matching Microsoft's public PDBs:
-
-| Configuration | features | result | handle | release | anchors |
-| --- | --- | --- | --- | --- | --- |
-| native ARM64 | `0x5F` → **`0x7F`** | located | `+0xD2270` | `+0xD2D18` | 2 |
-| x64 under ARM64X | `0x5F` | **refused** | `+0x218700` | — | 2 |
-| genuine x64 (2022) | `0x7F` | located | `+0x35BF0` | `+0x82394` | 2 |
-
-Verified at volume: 7,200 load/unload cycles on ARM64 and 24,000 on genuine x64,
-zero load, unload, ping or integrity failures. That also exercises
-`LdrpReleaseTlsEntry` specifically — a wrong one would leak TLS indices until
-ntdll's bitmap exhausted, and it does not.
-
-Two findings that shaped the implementation, both of which cost a debugging round:
-
-- **"Our" instruction set must be read from an ntdll export, not a compile-time
-  macro.** The first attempt derived it from a function in *this* DLL, producing a
-  nonsense RVA that matched no code range, so every candidate was skipped and
-  ARM64 still reported OFF. On ARM64X the same ntdll file serves both an ARM64 and
-  an ARM64EC view; only the address `GetProcAddress` hands *us* says which we are
-  in, and for an x64 process it is a fast-forward thunk that has to be followed.
-- **Chained fragments must be scanned for the release candidate.** Server 2022's
-  ntdll is BBT-split and `LdrpHandleTlsData` has a cold fragment; the call to
-  `LdrpReleaseTlsEntry` lives there, so scanning only the primary's extent found
-  no candidate and the build silently fell back to the legacy scan
-  (`anchors=1`). Following the unwind chain to collect every fragment fixed it.
-
-### x64 under ARM64X: refused, and why that is the answer
+| Configuration | features | TLS |
+| --- | --- | --- |
+| native ARM64 | `0x6F` | ON — `LdrpHandleTlsData` `+0xD2270`, `LdrpReleaseTlsEntry` `+0xD2D18` |
+| **x64 under ARM64X** | `0x0F` | **OFF — located, then refused** |
+| genuine x64 (Server 2022) | `0x6F` | ON — `+0x35BF0` / `+0x82394` |
 
 On ARM64X ntdll's loader is compiled twice and the copy an x64 process reaches is
 ARM64EC. The dword before an ARM64EC function is `(entryThunkRva - fnRva) | 1`;
@@ -78,107 +29,34 @@ it is non-zero for exported functions and **`0` for `#LdrpHandleTlsData`,
 terminates the process with `STATUS_WX86_INTERNAL_ERROR` (`0xC000026F`) and **is
 not catchable by SEH**.
 
-So the locator finds the right address there and then refuses it. The harness
-prints `REFUSED (ARM64EC: not callable here)`, which reads differently from "not
-located" on purpose — the address is correct, the platform will not allow the
-call. The previous build was safe here only by accident, because its scan failed;
-a locator without this gate would have converted a silent no-op into an
-undiagnosable process kill.
+So `MmpLocateNtdllTls` finds the right address there and refuses it. The harness
+prints `REFUSED (ARM64EC: not callable here)`, deliberately distinct from "not
+located": the address is correct, the platform will not allow the call. Before
+this was a decision, the build was safe here only because its x64 byte scan
+happened to fail.
 
-**The remaining option for that configuration is `MMPP_USE_TLS=1`**, the
-library's own TLS implementation in `MmpTls.cpp`, which needs no ntdll internals.
-It is not the default and should not be enabled lightly: it Detour-patches
-`RtlUserThreadStart`, `LdrShutdownThread` and `NtSetInformationProcess`
-process-wide and takes over `ThreadLocalStoragePointer`. Inside a JVM that is a
-compatibility surface against every profiler, APM and AV agent, and it is the
-same "reimplement OS behaviour" pattern that every durable fix in this project
-moved *away* from. It compiles cleanly today but **will not link**: the Detours
-sources in `3rdparty/Detours` are not in `MemoryModule.vcxproj`. Enabling it is a
-deliberate decision with a build change attached, not a fallback.
+**Consequence:** a memory-loaded module with a TLS directory gets no TLS in that
+configuration. Loads still succeed if the caller passes
+`LOAD_FLAGS_NOT_FAIL_IF_HANDLE_TLS`; without it they fail, which is the honest
+outcome. `thread_local` in such a module resolves through an unallocated index.
 
-**Still not done:** `MmpTlsInitialize()`'s return value is still discarded by its
-caller, so a future failure remains silent at the call site. The exported
-`MmpTlsLocated` / `MmpTlsRefused` / `MmpTlsAgreement` make it visible to anyone
-who looks, and the harness prints them, but the library does not act on it.
+**The available option is `MMPP_USE_TLS=1`** — the library's own TLS
+implementation in `MmpTls.cpp`, which needs no ntdll internals and so is immune
+to the EC problem. It is not the default and should not be enabled casually: it
+Detour-patches `RtlUserThreadStart`, `LdrShutdownThread` and
+`NtSetInformationProcess` **process-wide** and takes over
+`ThreadLocalStoragePointer`. Inside a JVM that is a compatibility surface against
+every profiler, APM and AV agent, and it is the same "reimplement OS behaviour"
+pattern that every durable fix in this project moved away from. It compiles
+cleanly today but **will not link**: the Detours sources in `3rdparty/Detours`
+are not in `MemoryModule.vcxproj`. Enabling it is a deliberate decision with a
+build change and a test campaign attached.
 
-### What became of "about one wrong answer per few thousand calls"
-
-The old issue 4 recorded roughly 1 wrong `StressPing` in 1,600 on arm64 and 1 in
-12,800 on genuine x64, and assumed it was `MmpHandleTlsData`. Both halves are now
-answered, and neither the way it was framed.
-
-**On arm64 and ARM64X there is nothing to attribute it to** — `MmpHandleTlsData`
-never runs. Whatever that rate was, it was the behaviour of an unallocated TLS
-index, not of the TLS code. Fixing §1 is what would change it.
-
-**On genuine x64, where the TLS path does run, it is not reproducible.**
-`stress --native` swaps only the loader and changes nothing else, so both arms
-are directly comparable:
-
-| arm | fresh loads | ping failures |
-| --- | --- | --- |
-| MemoryModulePP | 120,000 | **0** |
-| ordinary `LoadLibraryW` | 120,000 | **0** |
-
-At 1 in 12,800 the MemoryModulePP arm should have shown about 9. Zero in 120,000
-puts the 95% upper bound (rule of three) at **1 in 40,000** — at least three times
-better than the recorded rate, and consistent with none at all. No difference
-between the two loaders is detectable at this sample size.
-
-Honest caveat: **one** ping failure was observed on that box earlier in the same
-session, in a single 1,200-load run, on a build predating several of the fixes
-since made. So "gone" is not proven — "below 1 in 40,000, and indistinguishable
-from the ordinary Windows loader" is what the measurement supports. Anyone
-re-opening this should re-measure with `stress --native` rather than trusting
-either number, and should check the `features` line first.
+The third option is to ship a native ARM64 build, where TLS now works.
 
 ---
 
-## 2. Every ntdll internal except the datatable lock is still pattern-scanned
-
-**Status:** partly closed. The two TLS rows are now ABI-located in the library (§1); the remaining three still use pattern scans, and verified replacements exist for all of them.
-
-The datatable lock is found by ABI-driven decode with donor agreement and a
-causality check. Nothing else is:
-
-| Target | How the library finds it | Risk |
-| --- | --- | --- |
-| `LdrpHandleTlsData` | **FIXED** — name literal, any-register xref, funclet via `RtlLookupFunctionEntry`, parent from two agreeing derivations | low; fails closed |
-| `LdrpReleaseTlsEntry` | **FIXED** — selected from the handler’s callees by which frees without allocating, must be unique | low; fails closed |
-| `LdrpModuleBaseAddressIndex` | `.data` byte scan, unaligned, unvalidated | medium — see §5 |
-| `LdrpInvertedFunctionTable` | byte scan, hardcoded offsets and `MaxCount 0x200` | low on x64 (no live caller since the `ReflectiveMapDll` fix) but **the scan still runs at init on every architecture**, so a wrong hit is pure downside. Gate it `#ifndef _WIN64` |
-| `LdrpHashTable` | structural derivation, validated by re-hashing | low — the best locator in the tree, and the standard the others should meet |
-
-Four standalone probes now exist, each verified on native ARM64, x64-under-ARM64X
-and genuine x64, and cross-checked against Microsoft's public PDBs (the probes
-themselves never read a PDB):
-
-| Probe | Finds | Result |
-| --- | --- | --- |
-| `stress/probe_tls_handle.cpp` | `LdrpHandleTlsData` | 2/2 anchors, behavioural proof, exact PDB match |
-| `stress/probe_tls_release.cpp` | `LdrpReleaseTlsEntry` | 7/7 anchors, causality proof, exact PDB match |
-| `stress/probe_baseindex.cpp` | `LdrpModuleBaseAddressIndex` | 75/75 processes deterministic |
-| `stress/probe_ift.cpp` | `LdrpInvertedFunctionTable`, `LdrpHashTable` | structural + behavioural, every hardcoded constant confirmed |
-
-Known weak spots carried forward, all fail-closed:
-
-- Both TLS probes rest ultimately on the `"LdrpHandleTlsData"` literal in
-  `.rdata`. If the compiler stops emitting the logging call, both anchors die
-  together and the answer is NOT LOCATED.
-- `probe_tls_release` does not survive the function being split into hot/cold
-  `.pdata` regions by BBT. Server 2022's ntdll is BBT-split; this function
-  happens not to be.
-- `probe_baseindex` treats `Tree->Min` as a hard requirement, so a future
-  `RTL_RB_TREE` gaining a field before `Min` fails closed even on a right answer.
-  Make it a scoring signal, not a gate.
-
-Also worth fixing while in there: `FindLdrpHashTable()` returns `nullptr` on the
-*first* failed candidate instead of trying the next module, so one transiently
-inconsistent ring disables the capability for the process lifetime.
-
----
-
-## 3. Holding the right lock is necessary, not proven sufficient
+## 2. Holding the right lock is necessary, not proven sufficient
 
 **Status:** open by construction, no known reproducer.
 
@@ -189,11 +67,13 @@ database it believes it allocated: the DDAG state machine, the loader work queue
 build starts checking. We fabricate an `LDR_DATA_TABLE_ENTRY` and assert
 `LdrModulesReadyToRun` directly.
 
-Note the pattern in what has actually worked here: the durable fixes were all
-"stop hand-maintaining an ntdll internal" — `RtlAddFunctionTable()` replaced
-editing `LdrpInvertedFunctionTable`, and the `LdrpHashTable` insert was dropped
-rather than corrected. The lock fix is the only one that keeps hand-maintaining
-an internal and just synchronises it better.
+Note the pattern in what has actually worked here. Every durable fix was of the
+form "stop hand-maintaining an ntdll internal": `RtlAddFunctionTable()` replaced
+editing `LdrpInvertedFunctionTable` — and with x86 gone, that apparatus is now
+deleted outright — the `LdrpHashTable` insert was dropped rather than corrected,
+and the TLS helpers are now located by ABI rather than by byte signature. The
+lock fix is the only one that keeps hand-maintaining an internal and just
+synchronises it better.
 
 **The stronger answer, still not taken:** stop publishing into ntdll's database
 at all. Keep the fabricated entry, because `LdrpHandleTlsData` needs the struct,
@@ -204,107 +84,100 @@ modules.
 
 ---
 
-## 4. The lock locator still fails silently when it fails
+## 3. Two locators still fail silently when they fail
 
-**Status:** margin materially improved; the failure mode is unchanged.
+**Status:** open by design; the failure direction is deliberate, the silence is
+the problem.
 
-Nine measured donors now, worst case five agreeing against a minimum of two
-(was two against two). Three decode on every configuration instead of one. But if
-a future Windows build inlines the acquire in donor after donor, agreement
-eventually drops below the minimum and the capability turns itself off — and that
-**presents as the original list corruption returning**, not as an error.
+Both the datatable lock and the TLS helpers fail closed — they turn the
+capability off rather than guess. That is right. What is missing is anyone acting
+on it: the library loads and runs regardless, and a locator that stops working
+after a Windows update **presents as the original bug returning**, not as an
+error.
 
-Mitigations in place: the harness prints
-`datatable lock : LOCATED at ntdll+0x… (N donors agreed, need 2)` every run, and
-`MmpModuleDatatableLockAgreement` is exported. A falling donor count is the only
-advance warning.
+Everything needed to detect it is exported and printed every run:
 
-**Not done:** no telemetry or hard failure when the lock cannot be found — the
-library loads and runs unsynchronized. Production code should read
-`MmpModuleDatatableLockLocated` and `MmpModuleDatatableLockVerified` at startup
-and decide for itself. Nothing does this yet.
+| Export | Meaning |
+| --- | --- |
+| `MmpModuleDatatableLockLocated` / `…Verified` / `…Agreement` | lock found / causality-proved / donors agreeing (9 donors, worst case 5, minimum 2) |
+| `MmpTlsLocated` / `MmpTlsRefused` / `MmpTlsAgreement` | TLS found / refused by the ARM64EC gate / anchors agreeing (2 required) |
+| `LdrQuerySystemMemoryModuleFeatures` | which capabilities actually came up |
 
-Two loader exports are deliberately excluded from the donor list,
+**Production code should read these at startup and decide for itself whether to
+proceed. Nothing does this yet.** A falling `Agreement` across Windows updates is
+the advance warning in both cases.
+
+Two loader exports are deliberately excluded from the lock's donor list,
 `LdrGetDllHandle` and `RtlQueueWorkItem`: both decode to a *different* ntdll SRW
 lock under ARM64EC. Do not add them back.
 
 ---
 
-## 5. The base-address index is still accepted without validation
+## 4. The base-address index is accepted without validation
 
-**Status:** open; the race that made it flaky is fixed, the weak acceptance is not.
+**Status:** open. The race that made it flaky is fixed; the weak acceptance is
+not.
 
 Discovery now runs under the datatable lock, which removed a measured 1.58%
-silent-failure rate on genuine x64. What remains is how the address is accepted:
-a byte-granular scan of `.data` only, taking any single match, with no check that
-the result is actually the module tree.
+silent-failure rate on genuine x64. What remains is *how* the address is
+accepted: a byte-granular scan of `.data` only, taking any single match, with no
+check that the result is actually the module tree.
 
-`stress/probe_baseindex.cpp` shows the stronger form: pointer-aligned scan for the
-`{Root, Min}` pair across all writable sections, then reconciliation against
+`stress/probe_baseindex.cpp` shows the stronger form — pointer-aligned scan for
+the `{Root, Min}` pair across all writable sections, then reconciliation against
 `PEB->Ldr->InLoadOrderModuleList` (set equality both ways, in-order ascending by
 `DllBase`, parent back-pointers consistent, binary search finds every module),
 then a behavioural load/free. 75/75 processes deterministic, and it never
 returned a wrong address.
 
-Also still true: `MEMORY_FEATURE_MODULE_BASEADDRESS_INDEX` being absent fails
-every memory load, and nothing reports why.
+`MEMORY_FEATURE_MODULE_BASEADDRESS_INDEX` being absent fails every memory load,
+and the features line is the only thing that says why.
 
 ---
 
-## 6. `MmpLoaderLockGuard` gives up, and inverts a lock order when it does
+## 5. Teardown still proceeds without the loader lock
 
-**Status:** open, never observed firing.
+**Status:** open, never observed.
 
-After 64 failed attempts the guard proceeds with `Held == false` and increments
-`MmpLoaderLockAcquireFailures`. For a caller about to splice ntdll's structures
-that is the one thing it must not do; it should fail the load. The counter has
-read 0 across every measurement.
+`MmpLoaderLockGuard` retries 64 times and then reports failure. Load paths now
+decline with `STATUS_LOCK_NOT_GRANTED` rather than publishing unserialized — that
+also closed the AB-BA inversion, where a failed acquire put the IAT resolver lock
+before the loader lock. Teardown paths have no way to decline and still proceed.
 
-Secondary consequence, same trigger: with `Held == false` the IAT resolver lock
-is taken before the loader lock, inverting the ordering used everywhere else and
-creating a genuine AB-BA deadlock against any other thread.
+`MmpLoaderLockAcquireFailures` is printed every run and has read 0 across every
+measurement, so this has never fired. The remaining question is what teardown
+*should* do instead; `__fastfail` on a condition never observed did not seem
+proportionate.
 
 ---
 
-## 7. Residuals from fixes that are otherwise done
+## 6. Smaller open items
 
-- **The causality check skips itself when the calling thread already owns the
-  loader lock** — a consumer calling in from their own `DllMain`, and the
-  reflective path, which must initialize there. Deliberate: the probe thread
-  could not start and a correct address would read as a failure. In that case
-  the lock rests on donor agreement plus structural checks and
-  `MmpModuleDatatableLockVerified` reads 0. Only a *positive* disproof stands the
-  capability down.
-- **`ReflectiveMapDll` has no unload path.** It publishes and never tears down.
-  Fine for a reflectively injected module that lives for the process, wrong if
-  anyone calls the export directly.
+- **`MmCleanup` unmaps the global data** while other threads may hold live
+  pointers into it. Needs a reference-counted or deferred teardown.
+- **`MmpAllocateGlobalData` derives its section name from `~pid ^ ProcessHeap`**,
+  which is guessable. The section is `\BaseNamedObjects\MMPP*<hash>`; another
+  process in the same session could open it.
 - **The equal-base branch is still reachable** by calling the exported
   `ReflectiveMapDll` on a module ntdll already has. It now fails closed with
   `STATUS_OBJECT_NAME_COLLISION` rather than corrupting the tree, but nothing
   rejects the call earlier.
+- **`ReflectiveMapDll` has no unload path.** It publishes and never tears down.
+  Fine for a reflectively injected module that lives for the process, wrong if
+  anyone calls the export directly.
 - **The IAT resolver APIs are not in `MemoryModulePP.def`**, so the
   `RemoveEntryList` fix there is correct by inspection and cannot be
   execution-tested without widening the public surface.
-
----
-
-## 8. Unbounded and cosmetic
-
-- **Address-space leak per failed load.** If `MmpInitializeStructure` returns
-  `STATUS_NOT_SUPPORTED` because a section starts before
-  `sizeOfHeaders + sizeof(MEMORYMODULE)`, the signature was never written, so
-  cleanup's `MapMemoryModuleHandle` returns null and `MemoryFreeLibrary` bails
-  out *before* the `VirtualFree`. The whole `SizeOfImage` reservation leaks.
-- **`MmCleanup` unmaps the global data** while other threads may hold live
-  pointers into it.
-- **`MmpAllocateGlobalData` leaks its section handle** on the success path, and
-  derives the section name from `~pid ^ ProcessHeap`, which is guessable.
-- **`MMP_GLOBAL_DATA_SIZE`** uses `sizeof(PMMP_IAT_DATA)` where it means
-  `sizeof(MMP_IAT_DATA)`. Harmless only because the macro is unused.
-- **`RtlProtectMrdata` caches into unsynchronized function-local statics.**
-  Benign — concurrent first-callers write the same values — but it is a race.
-- **`MmpTlsFiber.cpp` is dead code** with an uninitialized `CRITICAL_SECTION`;
-  its only initializer lives in the compiled-out `MmpTls.cpp`.
+- **The causality check skips itself when the calling thread already owns the
+  loader lock** — a consumer calling in from their own `DllMain`, and the
+  reflective path. Deliberate: the probe thread could not start and a correct
+  address would read as a failure. `MmpModuleDatatableLockVerified` reads 0 to say
+  so, and only a *positive* disproof stands the capability down.
+- **The duplicate-module scan matches loosely.** It compares base name with
+  `dist == 0 || dist == 4`, then only `SizeOfCode` and `SizeOfHeaders`. Two
+  different DLLs sharing a base name and those two header fields would alias, and
+  re-loading a *different build* of the same-named DLL can silently return the old
+  module. Give distinct content distinct names.
 
 ---
 
@@ -313,29 +186,36 @@ creating a genuine AB-BA deadlock against any other thread.
 - **On ARM64X the same ntdll resolves loader globals to different RVAs depending
   on the process view.** Same image base, same `TimeDateStamp`: datatable lock
   `+0x3929E0` native ARM64 vs `+0x38E930` as x64; base index `+0x3929F8` vs
-  `+0x38E960`; hash table `+0x392DE0` vs `+0x394AA0`. The deltas differ between
-  symbols, so it is not an image shift — ARM64X dynamic relocations give the EC
-  view its own globals. **Any RVA table must be keyed on process architecture,
-  not just on the ntdll build id.**
+  `+0x38E960`; hash table `+0x392DE0` vs `+0x394AA0`; `LdrpHandleTlsData`
+  `+0xD2270` vs `+0x218700`. The deltas differ between symbols, so it is not an
+  image shift — ARM64X dynamic relocations give the EC view its own globals.
+  **Any RVA table must be keyed on process architecture, not just on the ntdll
+  build id.**
+- **"Which instruction set am I" must be read from an ntdll export, not a
+  compile-time macro.** Only the address `GetProcAddress` hands *you* says which
+  view you are in, and for an x64 process on ARM64X it is a fast-forward thunk
+  that has to be followed first. Getting this wrong is silent: every candidate
+  gets skipped and the capability reports "not found".
+- **ntdll is BBT-split on some builds.** Server 2022's `LdrpHandleTlsData` has a
+  cold fragment at `+0xB851E`; anything scanning a function's body must follow the
+  unwind chain to collect every fragment or it will silently miss code.
 - **ARM64X carries two inverted function tables**, both structurally valid and
-  both incremented on every load. They are told apart by which table's
-  `ExceptionDirectory` column reproduces *this* view's `.pdata` pointers. The
-  library gets this right by construction rather than by intent — anyone
-  simplifying its byte pattern would make it a coin flip.
-- **`.mrdata` reads `PAGE_READONLY` on all three configurations**, so
-  `RtlProtectMrdata`'s page flip — and the race documented above
-  `MmpRegisterExceptionTable` — is exactly as described.
+  both incremented on every load, told apart by which one's `ExceptionDirectory`
+  column reproduces this view's `.pdata`. No longer relevant to the library, which
+  does not touch them at all, but it will bite anyone who goes looking.
+- **`.mrdata` reads `PAGE_READONLY`**, and flipping it races ntdll's own flip
+  regardless of what lock is held. That is why unwind info goes through
+  `RtlAddFunctionTable` and the inverted-table code is gone.
 
 ---
 
 ## Bench caveats
 
 - **Read the `features` line before reading anything else.** A run with
-  `tls-handle=OFF` says nothing about TLS handling; a run with `base-index=OFF`
-  would fail every load. Both are printed on every run now.
-- **Measure on arm64 for contention**, but remember TLS handling is off there
-  (§1), so arm64 cannot test anything TLS-related. Genuine x64 is the only
-  configuration where the TLS path runs at all.
+  `tls-handle=OFF` says nothing about TLS handling; `base-index=OFF` would fail
+  every load. Both print every run, with a warning when TLS is off.
+- **Measure on arm64 for contention**, but check `features` first — the three
+  configurations no longer have the same capabilities.
 - **Exit code is the classifier**, not the console text: `0` clean, `1` soft,
   `0xC0000409` list corruption, `0xC0000374` heap corruption. Capture it with
   `Start-Process -PassThru`; bash mangles NTSTATUS values (`0xC0000409` arrives
@@ -350,7 +230,9 @@ creating a genuine AB-BA deadlock against any other thread.
   here and cost a round of wrong conclusions.
 - **Do not read ntdll PE `TimeDateStamp` values as dates.** They are
   reproducible-build hashes.
-- **On an unfamiliar build, run `lockprobe --survey` before guessing.** It groups
-  every named ntdll export by the address it yields and marks the group that
-  passes the causality check. Pick the group by that mark, never by size — the
-  largest group is not the lock.
+- **On an unfamiliar build, run the probes before guessing.** `lockprobe --survey`
+  groups every named ntdll export by the address it yields and marks the group
+  that passes the causality check — pick by that mark, never by size, because the
+  largest group is not the lock. `probe_tls_handle`, `probe_tls_release`,
+  `probe_baseindex` and `probe_ift` do the same for their targets, each verified
+  against Microsoft's public PDBs on three configurations.

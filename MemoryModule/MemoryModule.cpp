@@ -314,7 +314,24 @@ NTSTATUS MemoryLoadLibrary(
 		return status;
 	} while (false);
 
-	MemoryFreeLibrary((HMEMORYMODULE)base);
+	//
+	// MemoryFreeLibrary finds the MEMORYMODULE by its signature, which
+	// MmpInitializeStructure writes into the image's header slack. If that failed
+	// -- STATUS_NOT_SUPPORTED when a section starts before
+	// sizeOfHeaders + sizeof(MEMORYMODULE) -- the signature was never written,
+	// MapMemoryModuleHandle returns null, and MemoryFreeLibrary bails out *before*
+	// its VirtualFree. The whole SizeOfImage reservation leaked, once per failed
+	// load, for the life of the process.
+	//
+	// Release it here in that case. Anything past MmpInitializeStructure has a
+	// valid structure and goes through the normal path.
+	//
+	if (MapMemoryModuleHandle((HMEMORYMODULE)base)) {
+		MemoryFreeLibrary((HMEMORYMODULE)base);
+	}
+	else {
+		VirtualFree(base, 0, MEM_RELEASE);
+	}
 	return status;
 }
 
