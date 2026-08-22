@@ -66,66 +66,6 @@ static __forceinline bool IsModuleUnloaded(PLDR_DATA_TABLE_ENTRY entry) {
 }
 
 
-BOOL IsValidLdrpHashTable(PLIST_ENTRY LdrpHashTable) {
-
-	//
-	// Additional checks are performed to ensure that the LdrpHashTable is valid.
-	//
-
-	__try {
-
-		for (ULONG i = 0; i < LDR_HASH_TABLE_ENTRIES; ++i) {
-			PLIST_ENTRY head = &LdrpHashTable[i], entry = head->Flink;
-
-			while (head != entry) {
-				PLDR_DATA_TABLE_ENTRY current = CONTAINING_RECORD(entry, LDR_DATA_TABLE_ENTRY, LDR_DATA_TABLE_ENTRY::HashLinks);
-
-				if (LdrHashEntry(current->BaseDllName) != i) {
-					return FALSE;
-				}
-
-				entry = entry->Flink;
-			}
-		}
-
-		return TRUE;
-	}
-	__except (EXCEPTION_EXECUTE_HANDLER) {
-		return FALSE;
-	}
-
-}
-
-PLIST_ENTRY FindLdrpHashTable() {
-	PLIST_ENTRY head = &NtCurrentPeb()->Ldr->InInitializationOrderModuleList, entry = head->Flink;
-
-	while (head != entry) {
-		PLDR_DATA_TABLE_ENTRY current = CONTAINING_RECORD(entry, LDR_DATA_TABLE_ENTRY, LDR_DATA_TABLE_ENTRY::InInitializationOrderLinks);
-		PLIST_ENTRY hashEntry = &current->HashLinks;
-
-		//
-		// A module alone in its bucket: its HashLinks ring has exactly one member,
-		// so Flink is the bucket head and the bucket index is the module's hash.
-		//
-		if (hashEntry->Flink != hashEntry && hashEntry->Flink->Flink == hashEntry) {
-			PLIST_ENTRY table = &hashEntry->Flink[-(LONG)LdrHashEntry(current->BaseDllName)];
-
-			//
-			// Keep looking rather than giving up on the first candidate that does
-			// not validate. This used to return nullptr here, so one module whose
-			// ring was momentarily inconsistent -- or one whose name hashes
-			// differently than this build computes -- disabled the hash table for
-			// the entire process lifetime, with no way to tell why.
-			//
-			if (IsValidLdrpHashTable(table)) return table;
-		}
-
-		entry = entry->Flink;
-	}
-
-	return nullptr;
-}
-
 VOID InitializeWindowsVersion() {
 
 	WINDOWS_VERSION version = WINDOWS_VERSION::invalid;
@@ -406,21 +346,18 @@ NTSTATUS InitializeLockHeld() {
 			//
 			// One acquisition spanning the whole discovery. Taking it separately
 			// per step would be a time-of-check race: the module list walk that
-			// finds ntdll's entry, the climb from that entry to the tree root,
-			// and the hash-table walk all have to see one consistent snapshot.
+			// finds ntdll's entry and the climb from that entry to the tree root
+			// have to see one consistent snapshot.
 			//
 			// Nothing in here re-enters the loader. RtlFindLdrTableEntryByBaseName
-			// and FindLdrpHashTable are plain list walks, and
-			// RtlFindMemoryBlockFromModuleSection is a byte scan over an already
-			// mapped image -- on 64-bit it uses ntdll's RtlCompareMemory directly
-			// rather than the GetProcAddress thunk the 32-bit build needs.
+			// is a plain list walk, and RtlFindMemoryBlockFromModuleSection is a
+			// byte scan over an already mapped image.
 			//
 			MmpDatatableLockGuard databaseLock;
 
 			pNtdllEntry = RtlFindLdrTableEntryByBaseName(L"ntdll.dll");
 			MmpGlobalDataPtr->MmpBaseAddressIndex->NtdllLdrEntry = pNtdllEntry;
 			MmpGlobalDataPtr->MmpBaseAddressIndex->LdrpModuleBaseAddressIndex = FindLdrpModuleBaseAddressIndex();
-			MmpGlobalDataPtr->MmpLdrEntry->LdrpHashTable = FindLdrpHashTable();
 		}
 
 		if (!pNtdllEntry) {
@@ -436,17 +373,18 @@ NTSTATUS InitializeLockHeld() {
 		MmpGlobalDataPtr->MmpBaseAddressIndex->_RtlRbRemoveNode = GetProcAddress((HMODULE)pNtdllEntry->DllBase, "RtlRbRemoveNode");
 
 		//
-		// LdrpInvertedFunctionTable is no longer located at all. Unwind info is
-		// published through RtlAddFunctionTable, which needs nothing from ntdll's
-		// internals, and with x86 support removed there is no caller left for the
-		// inverted table. The feature bit stays defined for ABI compatibility but
-		// is never set; MEMORY_FEATURE_ALL callers should not expect it.
+		// LdrpHashTable and LdrpInvertedFunctionTable are no longer located. We
+		// deliberately never write to either -- see the note in
+		// RtlInsertMemoryTableEntry, and MmpRegisterExceptionTable for unwind info
+		// -- so finding them was pure startup cost. The hash table was the more
+		// expensive of the two: validating a candidate re-hashed every entry in
+		// all 32 buckets, and since discovery moved under the datatable lock that
+		// walk was blocking ntdll's own loader while it ran.
 		//
-		MmpGlobalDataPtr->MmpInvertedFunctionTable->LdrpInvertedFunctionTable = nullptr;
-
+		// Their feature bits stay defined for ABI but are never set.
+		//
         MmpGlobalDataPtr->MmpFeatures = MEMORY_FEATURE_SUPPORT_VERSION | MEMORY_FEATURE_LDRP_HEAP | MEMORY_FEATURE_LDRP_HANDLE_TLS_DATA | MEMORY_FEATURE_LDRP_RELEASE_TLS_ENTRY;
         if (MmpGlobalDataPtr->MmpBaseAddressIndex->LdrpModuleBaseAddressIndex)MmpGlobalDataPtr->MmpFeatures |= MEMORY_FEATURE_MODULE_BASEADDRESS_INDEX;
-        if (MmpGlobalDataPtr->MmpLdrEntry->LdrpHashTable)MmpGlobalDataPtr->MmpFeatures |= MEMORY_FEATURE_LDRP_HASH_TABLE;
 
 		MmpGlobalDataPtr->MmpFunctions->_LdrLoadDllMemoryExW = LdrLoadDllMemoryExW;
 		MmpGlobalDataPtr->MmpFunctions->_LdrUnloadDllMemory = LdrUnloadDllMemory;

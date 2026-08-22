@@ -630,8 +630,23 @@ static ULONG MmpLocateHandleTlsData(_Out_ ULONG* Agreement) {
 
 	static const char name[] = "LdrpHandleTlsData";
 	ULONG strRva = 0;
-	for (SIZE_T off = 0; off + sizeof(name) <= MmpNtSize; ++off) {
-		if (RtlCompareMemory(MmpNt + off, name, sizeof(name)) == sizeof(name)) { strRva = (ULONG)off; break; }
+	//
+	// Only the non-executable sections, and only where the first byte already
+	// matches. Scanning the whole image and calling RtlCompareMemory at every
+	// offset meant several million calls across ntdll -- the single most
+	// expensive thing in initialization once the unused locators were dropped.
+	//
+	for (ULONG si = 0; si < MmpSecCount && !strRva; ++si) {
+		if (MmpSec[si].Exec) continue;
+		const UCHAR* p = MmpNt + MmpSec[si].Rva;
+		SIZE_T len = MmpSec[si].Size;
+		for (SIZE_T off = 0; off + sizeof(name) <= len; ++off) {
+			if (p[off] != name[0]) continue;
+			if (RtlCompareMemory(p + off, name, sizeof(name)) == sizeof(name)) {
+				strRva = (ULONG)(MmpSec[si].Rva + off);
+				break;
+			}
+		}
 	}
 	if (!strRva) return 0;
 

@@ -543,10 +543,23 @@ static struct {
 	HANDLE Ready;
 	HANDLE Go;
 	HANDLE Done;
-} MmpLockProbe = { nullptr, nullptr, nullptr };
+	ULONG  UnblockedMs;                 // how long the same load takes with nothing held
+} MmpLockProbe = { nullptr, nullptr, nullptr, 0 };
 
 static DWORD WINAPI MmpLockProbeThread(LPVOID Parameter) {
 	UNREFERENCED_PARAMETER(Parameter);
+
+	//
+	// One warm-up load with nothing held, timed. It serves two purposes: it puts
+	// version.dll in the process so the measured operation below is the ordinary
+	// refcount path rather than a cold map, and it says how long that path takes
+	// on this machine -- which is what sizes the wait in the caller.
+	//
+	ULONGLONG start = GetTickCount64();
+	HMODULE warm = LoadLibraryW(L"version.dll");
+	if (warm) FreeLibrary(warm);
+	MmpLockProbe.UnblockedMs = (ULONG)(GetTickCount64() - start);
+
 	SetEvent(MmpLockProbe.Ready);
 	WaitForSingleObject(MmpLockProbe.Go, INFINITE);
 
@@ -614,9 +627,28 @@ VOID NTAPI MmpVerifyModuleDatatableLock() {
 	//
 	if (WaitForSingleObject(MmpLockProbe.Ready, 5000) != WAIT_OBJECT_0) return;
 
+	//
+	// How long to wait for the load that must NOT complete.
+	//
+	// This was a flat 400ms, picked conservatively, and it was almost the whole
+	// of initialization: the actual work is tens of milliseconds. Derive it
+	// instead from what the same load just took with nothing held, with a wide
+	// margin. On an idle machine the warm-up measures 0-1ms and this comes out at
+	// the 50ms floor, which is still two orders of magnitude of headroom; on a
+	// loaded machine it scales up on its own.
+	//
+	// Erring short only costs detection power, never correctness: a timeout here
+	// is the *expected* result, and the failure it would miss -- a wrong address
+	// letting the load through -- leaves the lock enabled on the structural
+	// checks, which is where it started.
+	//
+	ULONG window = MmpLockProbe.UnblockedMs * 20;
+	if (window < 50) window = 50;
+	if (window > 400) window = 400;
+
 	MmpAcquireSRWLockExclusive(MmpModuleDatatableLock);
 	SetEvent(MmpLockProbe.Go);
-	DWORD blocked = WaitForSingleObject(MmpLockProbe.Done, 400);
+	DWORD blocked = WaitForSingleObject(MmpLockProbe.Done, window);
 	MmpReleaseSRWLockExclusive(MmpModuleDatatableLock);
 	DWORD freed = WaitForSingleObject(MmpLockProbe.Done, 5000);
 
