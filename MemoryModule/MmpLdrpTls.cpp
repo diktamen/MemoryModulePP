@@ -180,14 +180,42 @@ static NTSTATUS NTAPI RtlFindLdrpReleaseTlsEntry() {
 }
 
 BOOL NTAPI MmpTlsInitialize() {
-	if (!NT_SUCCESS(RtlFindLdrpHandleTlsData()) ||
-		!NT_SUCCESS(RtlFindLdrpReleaseTlsEntry())) {
-
+	//
+	// MmpLocateNtdllTls is the ABI-driven locator; see NtdllTls.h for why the
+	// signature scans above cannot work outside genuine x64. They are kept as a
+	// fallback because they are the measured-correct answer there and cost
+	// nothing to try, but they are tried second, and only when the new locator
+	// found nothing at all.
+	//
+	// The ordering is load-bearing. MmpLocateNtdllTls is the only path that
+	// applies the ARM64EC callability gate, so trying the scans first would, on a
+	// build where one happened to hit, hand us an address the emulator ends the
+	// process for calling.
+	//
+	if (!MmpLocateNtdllTls(&LdrpHandleTlsData, &LdrpReleaseTlsEntry)) {
 		LdrpHandleTlsData = nullptr;
 		LdrpReleaseTlsEntry = nullptr;
 
-		MmpGlobalDataPtr->MmpFeatures &= ~MEMORY_FEATURE_LDRP_HANDLE_TLS_DATA;
-		return FALSE;
+		//
+		// Refused, rather than not found, means the addresses are correct and
+		// this process must not call them -- an ARM64EC platform limit. Falling
+		// back would just find the same unusable code, so do not.
+		//
+		if (MmpTlsRefused ||
+			!NT_SUCCESS(RtlFindLdrpHandleTlsData()) ||
+			!NT_SUCCESS(RtlFindLdrpReleaseTlsEntry())) {
+
+			LdrpHandleTlsData = nullptr;
+			LdrpReleaseTlsEntry = nullptr;
+			MmpGlobalDataPtr->MmpFeatures &= ~MEMORY_FEATURE_LDRP_HANDLE_TLS_DATA;
+			return FALSE;
+		}
+
+		ULONG_PTR nt = (ULONG_PTR)MmpGlobalDataPtr->MmpBaseAddressIndex->NtdllLdrEntry->DllBase;
+		MmpTlsHandleRva = (LONG)((ULONG_PTR)LdrpHandleTlsData - nt);
+		MmpTlsReleaseRva = (LONG)((ULONG_PTR)LdrpReleaseTlsEntry - nt);
+		MmpTlsAgreement = 1;                        // signature scan: a single anchor
+		MmpTlsLocated = 1;
 	}
 
 	stdcall = !RtlIsWindowsVersionOrGreater(6, 3, 0);

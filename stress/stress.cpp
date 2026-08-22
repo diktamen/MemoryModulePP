@@ -262,6 +262,27 @@ int main(int argc, char** argv) {
                 (features & MEMORY_FEATURE_MODULE_BASEADDRESS_INDEX) ? "ON" : "OFF",
                 (features & MEMORY_FEATURE_LDRP_HASH_TABLE) ? "ON" : "OFF",
                 (features & MEMORY_FEATURE_INVERTED_FUNCTION_TABLE) ? "ON" : "OFF");
+            //
+            // Where the TLS locator actually got to. "Refused" is the ARM64EC
+            // gate: the addresses are right and this process must not call them,
+            // which is a platform limit rather than a locator failure and has to
+            // read differently from "found nothing".
+            //
+            auto tlsLoc = (volatile LONG*)GetProcAddress(mm, "MmpTlsLocated");
+            auto tlsH = (volatile LONG*)GetProcAddress(mm, "MmpTlsHandleRva");
+            auto tlsR = (volatile LONG*)GetProcAddress(mm, "MmpTlsReleaseRva");
+            auto tlsA = (volatile LONG*)GetProcAddress(mm, "MmpTlsAgreement");
+            auto tlsX = (volatile LONG*)GetProcAddress(mm, "MmpTlsRefused");
+            if (tlsLoc) {
+                printf("  ntdll tls: %s  handle=ntdll+0x%lX release=ntdll+0x%lX anchors=%ld%s\n",
+                    *tlsLoc ? "located" : (tlsX && *tlsX ? "REFUSED (ARM64EC: not callable here)"
+                                                         : "not located"),
+                    tlsH ? (unsigned long)*tlsH : 0ul,
+                    tlsR ? (unsigned long)*tlsR : 0ul,
+                    tlsA ? (long)*tlsA : -1,
+                    (tlsX && *tlsX) ? "" : "");
+            }
+
             if (!g_native && !(features & MEMORY_FEATURE_LDRP_HANDLE_TLS_DATA)) {
                 printf("  WARNING  : TLS handling is OFF -- memory-loaded modules get no TLS\n"
                        "             setup at all, so ping results say nothing about\n"

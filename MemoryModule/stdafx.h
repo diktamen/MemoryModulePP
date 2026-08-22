@@ -39,6 +39,9 @@
 //tls support
 #include "MmpTls.h"
 
+//locating ntdll's TLS helpers, and the ARM64EC callability gate
+#include "NtdllTls.h"
+
 //MemoryModulePP api interface
 #include "Loader.h"
 

@@ -11,55 +11,95 @@ Ordered by how likely each is to bite in production.
 
 ---
 
-## 1. TLS is not set up at all on ARM64 or on x64-under-ARM64X
+## 1. TLS on ARM64 — FIXED. The ARM64X-x64 case is a platform limit.
 
-**Status:** open, actively happening on every load, silent.
+**Status:** ARM64 now has real TLS for the first time. x64-under-ARM64X refuses
+by design, which is the correct answer rather than a gap.
 
-This is the most serious item on the list and the newest. Measured with
-`LdrQuerySystemMemoryModuleFeatures`, which the harness now prints every run:
+The old locators were x64 byte signatures, and one of them was compiled under
+`#ifdef _WIN64` — **which is defined for ARM64 too** — so an ARM64 build searched
+ARM64 `.text` for x64 machine code. Byte-scanned directly: 1 hit on Server 2022
+x64 (correct), 0 hits in the ARM64X ntdll. When either scan missed,
+`MmpTlsInitialize()` nulled *both* pointers, cleared the feature bit after having
+set it, and returned FALSE into a caller that discards it — and the load then
+succeeded anyway because callers pass `LOAD_FLAGS_NOT_FAIL_IF_HANDLE_TLS`. Every
+memory-loaded module on ARM64 ran with no TLS at all, reporting `PASS`.
 
-| Configuration | features | `LDRP_HANDLE_TLS_DATA` |
-| --- | --- | --- |
-| native ARM64 | `0x5F` | **OFF** |
-| x64 under ARM64X | `0x5F` | **OFF** |
-| genuine x64 (Server 2022) | `0x7F` | ON |
+`MemoryModule/NtdllTls.cpp` replaces both with an ABI-driven locator:
 
-Two independent causes, either sufficient:
+- **`LdrpHandleTlsData`** — ntdll logs its own name, so the literal sits in
+  read-only data. Find every reference to it from executable code accepting *any*
+  destination register on x64 and `adrp`+`add` on ARM64 (the old scan hardcoded
+  `lea rdx`, which is most of why it found nothing elsewhere). The reference is
+  inside an exception filter funclet; `RtlLookupFunctionEntry` — exported, and on
+  ARM64X already aware which function table applies to this view — turns it into
+  the funclet's start. Then recover the parent **two independent ways**, from the
+  validated scope record in read-only data and by walking every function's own
+  unwind data, and require both to agree.
+- **`LdrpReleaseTlsEntry`** — has no name literal anywhere in ntdll, so it is
+  selected from `LdrpHandleTlsData`'s direct callees (it is called on the error
+  path) by requiring that it calls the exported `RtlFreeHeap`, never calls
+  `RtlAllocateHeap`, and is small. The winner must be unique.
+- **ARM64EC gate** — applied before anything is called.
 
-- `RtlFindLdrpHandleTlsData10` scans `.text` for the literal bytes `48 8D 15`
-  (`lea rdx,[rip+disp32]`) — an x64-only encoding, and it also hardcodes the
-  destination register.
-- `RtlFindLdrpReleaseTlsEntry` compiles a 21-byte x64 signature under
-  `#ifdef _WIN64` — **and `_WIN64` is defined for ARM64** — then searches ARM64
-  `.text` for x64 machine code. Byte-scanned directly: 1 hit on Server 2022 x64
-  (correct), **0 hits in the ARM64X ntdll**.
+Measured, with every address matching Microsoft's public PDBs:
 
-When either misses, `MmpTlsInitialize()` nulls *both* TLS pointers, clears the
-feature bit after having set it, and returns FALSE into a caller that discards
-it. The load then succeeds anyway whenever the caller passes
-`LOAD_FLAGS_NOT_FAIL_IF_HANDLE_TLS`, so **memory-loaded modules run with no TLS
-and nothing reports it.** The payload's `thread_local` resolves through an
-unallocated index; it mostly appears to work because the fallback slot is still
-per-thread.
+| Configuration | features | result | handle | release | anchors |
+| --- | --- | --- | --- | --- | --- |
+| native ARM64 | `0x5F` → **`0x7F`** | located | `+0xD2270` | `+0xD2D18` | 2 |
+| x64 under ARM64X | `0x5F` | **refused** | `+0x218700` | — | 2 |
+| genuine x64 (2022) | `0x7F` | located | `+0x35BF0` | `+0x82394` | 2 |
 
-Also dead code: the release scan requires `MajorVersion == 10` exactly, so on any
-other version it returns `STATUS_NOT_SUPPORTED` first — the elaborate 6.1/6.2/6.3
-`LdrpHandleTlsData` patterns above it can never run.
+Verified at volume: 7,200 load/unload cycles on ARM64 and 24,000 on genuine x64,
+zero load, unload, ping or integrity failures. That also exercises
+`LdrpReleaseTlsEntry` specifically — a wrong one would leak TLS indices until
+ntdll's bitmap exhausted, and it does not.
 
-**Do not just fix the locator.** On ARM64X ntdll's loader is compiled twice and
-the copy an x64 process reaches is ARM64EC. The dword before an ARM64EC function
-is `(entryThunkRVA - fnRVA) | 1`; it is non-zero for exported functions and
-**`0` for `#LdrpHandleTlsData`, `#LdrpReleaseTlsEntry` and `#LdrpFindTlsEntry`**.
-Calling one from emulated x64 terminates the process with
-`STATUS_WX86_INTERNAL_ERROR` (`0xC000026F`) and **is not catchable by SEH**. The
-current build escapes this only because its scan already fails. A better locator
-without an architecture-callability gate converts a silent no-op into an
+Two findings that shaped the implementation, both of which cost a debugging round:
+
+- **"Our" instruction set must be read from an ntdll export, not a compile-time
+  macro.** The first attempt derived it from a function in *this* DLL, producing a
+  nonsense RVA that matched no code range, so every candidate was skipped and
+  ARM64 still reported OFF. On ARM64X the same ntdll file serves both an ARM64 and
+  an ARM64EC view; only the address `GetProcAddress` hands *us* says which we are
+  in, and for an x64 process it is a fast-forward thunk that has to be followed.
+- **Chained fragments must be scanned for the release candidate.** Server 2022's
+  ntdll is BBT-split and `LdrpHandleTlsData` has a cold fragment; the call to
+  `LdrpReleaseTlsEntry` lives there, so scanning only the primary's extent found
+  no candidate and the build silently fell back to the legacy scan
+  (`anchors=1`). Following the unwind chain to collect every fragment fixed it.
+
+### x64 under ARM64X: refused, and why that is the answer
+
+On ARM64X ntdll's loader is compiled twice and the copy an x64 process reaches is
+ARM64EC. The dword before an ARM64EC function is `(entryThunkRva - fnRva) | 1`;
+it is non-zero for exported functions and **`0` for `#LdrpHandleTlsData`,
+`#LdrpReleaseTlsEntry` and `#LdrpFindTlsEntry`**. Calling one from emulated x64
+terminates the process with `STATUS_WX86_INTERNAL_ERROR` (`0xC000026F`) and **is
+not catchable by SEH**.
+
+So the locator finds the right address there and then refuses it. The harness
+prints `REFUSED (ARM64EC: not callable here)`, which reads differently from "not
+located" on purpose — the address is correct, the platform will not allow the
+call. The previous build was safe here only by accident, because its scan failed;
+a locator without this gate would have converted a silent no-op into an
 undiagnosable process kill.
 
-**What to do:** adopt `stress/probe_tls_release.cpp`'s pipeline — it locates
-`LdrpHandleTlsData` for free as the winner's caller, so both rows go together.
-Gate on the entry-thunk marker. Stop discarding `MmpTlsInitialize()`'s return.
-See §2 for the probe results.
+**The remaining option for that configuration is `MMPP_USE_TLS=1`**, the
+library's own TLS implementation in `MmpTls.cpp`, which needs no ntdll internals.
+It is not the default and should not be enabled lightly: it Detour-patches
+`RtlUserThreadStart`, `LdrShutdownThread` and `NtSetInformationProcess`
+process-wide and takes over `ThreadLocalStoragePointer`. Inside a JVM that is a
+compatibility surface against every profiler, APM and AV agent, and it is the
+same "reimplement OS behaviour" pattern that every durable fix in this project
+moved *away* from. It compiles cleanly today but **will not link**: the Detours
+sources in `3rdparty/Detours` are not in `MemoryModule.vcxproj`. Enabling it is a
+deliberate decision with a build change attached, not a fallback.
+
+**Still not done:** `MmpTlsInitialize()`'s return value is still discarded by its
+caller, so a future failure remains silent at the call site. The exported
+`MmpTlsLocated` / `MmpTlsRefused` / `MmpTlsAgreement` make it visible to anyone
+who looks, and the harness prints them, but the library does not act on it.
 
 ### What became of "about one wrong answer per few thousand calls"
 
@@ -96,15 +136,15 @@ either number, and should check the `features` line first.
 
 ## 2. Every ntdll internal except the datatable lock is still pattern-scanned
 
-**Status:** open. Verified replacements exist and are not adopted.
+**Status:** partly closed. The two TLS rows are now ABI-located in the library (§1); the remaining three still use pattern scans, and verified replacements exist for all of them.
 
 The datatable lock is found by ABI-driven decode with donor agreement and a
 causality check. Nothing else is:
 
 | Target | How the library finds it | Risk |
 | --- | --- | --- |
-| `LdrpHandleTlsData` | multi-stage `.rdata`/`.text` scan, hardcoded prologue offsets | **broken on ARM64/ARM64X — see §1** |
-| `LdrpReleaseTlsEntry` | one hardcoded 21-byte x64 signature, `MajorVersion == 10` only | **broken on ARM64/ARM64X — see §1** |
+| `LdrpHandleTlsData` | **FIXED** — name literal, any-register xref, funclet via `RtlLookupFunctionEntry`, parent from two agreeing derivations | low; fails closed |
+| `LdrpReleaseTlsEntry` | **FIXED** — selected from the handler’s callees by which frees without allocating, must be unique | low; fails closed |
 | `LdrpModuleBaseAddressIndex` | `.data` byte scan, unaligned, unvalidated | medium — see §5 |
 | `LdrpInvertedFunctionTable` | byte scan, hardcoded offsets and `MaxCount 0x200` | low on x64 (no live caller since the `ReflectiveMapDll` fix) but **the scan still runs at init on every architecture**, so a wrong hit is pure downside. Gate it `#ifndef _WIN64` |
 | `LdrpHashTable` | structural derivation, validated by re-hashing | low — the best locator in the tree, and the standard the others should meet |
